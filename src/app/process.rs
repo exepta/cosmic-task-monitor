@@ -67,7 +67,6 @@ impl AppModel {
         }
 
         let mut groups: HashMap<String, Aggregate> = HashMap::new();
-        let mut app_pids: HashMap<String, HashSet<u32>> = HashMap::new();
         let mut steam_apps_by_id = std::mem::take(&mut self.steam_apps_by_id);
         let steam_icon_handle = self
             .desktop_apps_by_exec
@@ -112,10 +111,6 @@ impl AppModel {
             if Self::is_excluded_app_id(&app_id) {
                 continue;
             }
-            app_pids
-                .entry(app_id.clone())
-                .or_default()
-                .insert(process.pid().as_u32());
 
             let entry = groups.entry(app_id).or_insert_with(|| Aggregate {
                 name: app_name,
@@ -131,254 +126,22 @@ impl AppModel {
             entry.threads += process.tasks().map_or(1, |tasks| tasks.len() as u32);
         }
 
-        const MAX_TOTAL_GPU_PIDS: usize = 256;
-        let mut gpu_pids = HashSet::new();
-        let mut all_pids = app_pids
-            .values()
-            .flat_map(|pids| pids.iter().copied())
-            .collect::<Vec<_>>();
-        // Stable ordering reduces sample churn and keeps delta math meaningful.
-        all_pids.sort_unstable();
-
-        for pid in all_pids.into_iter().take(MAX_TOTAL_GPU_PIDS) {
-            gpu_pids.insert(Pid::from_u32(pid));
-        }
-        let gpu_usage_by_pid = self.gpu_usage_by_pid(&gpu_pids);
-
         self.process_entries = groups
             .into_iter()
-            .map(|(app_id, entry)| {
-                let gpu_percent = app_pids
-                    .get(&app_id)
-                    .map(|pids| {
-                        pids.iter()
-                            .map(|pid| gpu_usage_by_pid.get(pid).copied().unwrap_or_default())
-                            .fold(0.0f32, f32::max)
-                    })
-                    .unwrap_or_default()
-                    .clamp(0.0, 100.0);
-
-                ProcessEntry {
-                    app_id,
-                    display_name: entry.name.clone(),
-                    name: entry.name,
-                    pid: entry.pid,
-                    icon_handle: entry.icon_handle,
-                    cpu_percent: entry.cpu_percent.clamp(0.0, 100.0),
-                    gpu_percent,
-                    rss_bytes: entry.rss_bytes,
-                    threads: entry.threads.max(1),
-                }
+            .map(|(app_id, entry)| ProcessEntry {
+                app_id,
+                display_name: entry.name.clone(),
+                name: entry.name,
+                pid: entry.pid,
+                icon_handle: entry.icon_handle,
+                cpu_percent: entry.cpu_percent.clamp(0.0, 100.0),
+                rss_bytes: entry.rss_bytes,
+                threads: entry.threads.max(1),
             })
             .collect();
 
         self.steam_apps_by_id = steam_apps_by_id;
         self.sort_process_entries();
-    }
-
-    // Collects best-effort per-process GPU usage percentages.
-    // Primary source is DRM fdinfo engine time (works across modern Mesa drivers).
-    // Falls back to NVIDIA pmon when DRM counters are unavailable.
-    fn gpu_usage_by_pid(&mut self, eligible_pids: &HashSet<Pid>) -> HashMap<u32, f32> {
-        let now = Instant::now();
-        const GPU_SAMPLE_INTERVAL: Duration = Duration::from_secs(4);
-
-        if let Some(last_sample_at) = self.last_gpu_sample_at {
-            if now.saturating_duration_since(last_sample_at) < GPU_SAMPLE_INTERVAL {
-                return self.last_gpu_usage_by_pid.clone();
-            }
-        }
-
-        let current_engine_ns_by_pid = Self::drm_engine_ns_by_pid(eligible_pids);
-
-        if current_engine_ns_by_pid.is_empty() {
-            self.gpu_engine_ns_by_pid.clear();
-            let usage = Self::nvidia_gpu_usage_by_pid();
-            self.last_gpu_usage_by_pid = usage.clone();
-            self.last_gpu_sample_at = Some(now);
-            return usage;
-        }
-
-        let mut usage_by_pid = HashMap::new();
-        if let Some(last_sample_at) = self.last_gpu_sample_at {
-            let elapsed_ns = now.saturating_duration_since(last_sample_at).as_nanos() as f64;
-            if elapsed_ns > 0.0 {
-                for (pid, current_ns) in &current_engine_ns_by_pid {
-                    let previous_ns = self
-                        .gpu_engine_ns_by_pid
-                        .get(pid)
-                        .copied()
-                        .unwrap_or(*current_ns);
-                    let delta_ns = current_ns.saturating_sub(previous_ns) as f64;
-                    let percent = (delta_ns / elapsed_ns * 100.0) as f32;
-                    usage_by_pid.insert(*pid, percent.clamp(0.0, 100.0));
-                }
-            }
-        }
-
-        self.gpu_engine_ns_by_pid = current_engine_ns_by_pid;
-        self.last_gpu_usage_by_pid = usage_by_pid.clone();
-        self.last_gpu_sample_at = Some(now);
-        usage_by_pid
-    }
-
-    fn drm_engine_ns_by_pid(eligible_pids: &HashSet<Pid>) -> HashMap<u32, u64> {
-        let mut totals = HashMap::new();
-        const MAX_FD_SCAN_PER_PID: usize = 2048;
-        const MAX_DRM_CLIENTS_PER_PID: usize = 4;
-
-        for pid in eligible_pids {
-            let pid_u32 = pid.as_u32();
-            let proc_dir = PathBuf::from("/proc").join(pid_u32.to_string());
-            let fd_dir = proc_dir.join("fd");
-            let fdinfo_dir = proc_dir.join("fdinfo");
-
-            let Ok(entries) = fs::read_dir(&fd_dir) else {
-                continue;
-            };
-
-            let mut client_totals = HashMap::<u64, u64>::new();
-            for entry in entries.flatten().take(MAX_FD_SCAN_PER_PID) {
-                let fd_name = entry.file_name();
-                let fd_path = entry.path();
-                let Ok(target) = fs::read_link(&fd_path) else {
-                    continue;
-                };
-                if !target.to_string_lossy().starts_with("/dev/dri/") {
-                    continue;
-                }
-
-                let Ok(content) = fs::read_to_string(fdinfo_dir.join(&fd_name)) else {
-                    continue;
-                };
-                if let Some(engine_ns) = Self::parse_drm_engine_ns(&content) {
-                    let fd_fallback_key = fd_name
-                        .to_str()
-                        .and_then(|name| name.parse::<u64>().ok())
-                        .unwrap_or(u64::MAX);
-                    let client_key = Self::parse_drm_client_id(&content).unwrap_or(fd_fallback_key);
-                    client_totals
-                        .entry(client_key)
-                        .and_modify(|current| *current = (*current).max(engine_ns))
-                        .or_insert(engine_ns);
-
-                    if client_totals.len() >= MAX_DRM_CLIENTS_PER_PID {
-                        break;
-                    }
-                }
-            }
-
-            let total_ns = client_totals
-                .values()
-                .copied()
-                .fold(0u64, |acc, value| acc.saturating_add(value));
-            if total_ns > 0 {
-                totals.insert(pid_u32, total_ns);
-            }
-        }
-
-        totals
-    }
-
-    fn parse_drm_client_id(fdinfo_content: &str) -> Option<u64> {
-        for line in fdinfo_content.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("drm-client-id:") else {
-                continue;
-            };
-            if let Some(id) = Self::parse_first_u64(rest) {
-                return Some(id);
-            }
-        }
-        None
-    }
-
-    fn parse_drm_engine_ns(fdinfo_content: &str) -> Option<u64> {
-        let mut total_ns = 0u64;
-        let mut found = false;
-
-        for line in fdinfo_content.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("drm-engine-") else {
-                continue;
-            };
-            let Some((_engine, value_part)) = rest.split_once(':') else {
-                continue;
-            };
-
-            let Some(ns) = Self::parse_first_u64(value_part) else {
-                continue;
-            };
-
-            total_ns = total_ns.saturating_add(ns);
-            found = true;
-        }
-
-        found.then_some(total_ns)
-    }
-
-    fn parse_first_u64(input: &str) -> Option<u64> {
-        let mut start = None;
-        for (idx, ch) in input.char_indices() {
-            if ch.is_ascii_digit() {
-                if start.is_none() {
-                    start = Some(idx);
-                }
-            } else if let Some(begin) = start {
-                return input[begin..idx].parse::<u64>().ok();
-            }
-        }
-
-        start.and_then(|begin| input[begin..].parse::<u64>().ok())
-    }
-
-    // Best-effort per-process GPU usage via NVIDIA pmon output.
-    // Returns an empty map when no NVIDIA tooling is available.
-    fn nvidia_gpu_usage_by_pid() -> HashMap<u32, f32> {
-        let Ok(output) = Command::new("nvidia-smi")
-            .args(["pmon", "-c", "1", "-s", "um"])
-            .output()
-        else {
-            return HashMap::new();
-        };
-        if !output.status.success() {
-            return HashMap::new();
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Self::parse_nvidia_pmon_output(&stdout)
-    }
-
-    fn parse_nvidia_pmon_output(output: &str) -> HashMap<u32, f32> {
-        let mut usage = HashMap::new();
-
-        for line in output.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 5 {
-                continue;
-            }
-
-            let Ok(pid) = cols[1].parse::<u32>() else {
-                continue;
-            };
-
-            let sm = match cols[3] {
-                "-" | "N/A" | "n/a" => 0.0,
-                value => value.parse::<f32>().unwrap_or(0.0),
-            };
-
-            usage
-                .entry(pid)
-                .and_modify(|current: &mut f32| *current = current.max(sm))
-                .or_insert(sm);
-        }
-
-        usage
     }
 
     pub(super) fn load_desktop_app_map() -> HashMap<String, DesktopAppMeta> {
@@ -1456,10 +1219,6 @@ impl AppModel {
                     .cpu_percent
                     .partial_cmp(&b.cpu_percent)
                     .unwrap_or(Ordering::Equal),
-                SortColumn::Gpu => a
-                    .gpu_percent
-                    .partial_cmp(&b.gpu_percent)
-                    .unwrap_or(Ordering::Equal),
                 SortColumn::Pid => a.pid.cmp(&b.pid),
                 SortColumn::Ram => a.rss_bytes.cmp(&b.rss_bytes),
                 SortColumn::Threads => a.threads.cmp(&b.threads),
@@ -1473,11 +1232,6 @@ impl AppModel {
             primary
                 .then_with(|| b.rss_bytes.cmp(&a.rss_bytes))
                 .then_with(|| {
-                    b.gpu_percent
-                        .partial_cmp(&a.gpu_percent)
-                        .unwrap_or(Ordering::Equal)
-                })
-                .then_with(|| {
                     b.cpu_percent
                         .partial_cmp(&a.cpu_percent)
                         .unwrap_or(Ordering::Equal)
@@ -1489,11 +1243,9 @@ impl AppModel {
     fn default_direction(column: SortColumn) -> SortDirection {
         match column {
             SortColumn::Name => SortDirection::Asc,
-            SortColumn::Cpu
-            | SortColumn::Gpu
-            | SortColumn::Pid
-            | SortColumn::Ram
-            | SortColumn::Threads => SortDirection::Desc,
+            SortColumn::Cpu | SortColumn::Pid | SortColumn::Ram | SortColumn::Threads => {
+                SortDirection::Desc
+            }
         }
     }
 
@@ -1685,55 +1437,5 @@ mod tests {
         let roots = AppModel::steam_library_roots_from_vdf(vdf);
         assert!(roots.iter().any(|p| p.ends_with("Steam")));
         assert!(roots.iter().any(|p| p.ends_with("SteamLibrary")));
-    }
-
-    #[test]
-    fn parses_nvidia_pmon_gpu_usage_by_pid() {
-        let pmon = r#"
-# gpu         pid  type    sm   mem   enc   dec   command
-# Idx           #   C/G     %     %     %     %   name
-    0      12345     G    35     0     0     0   game
-    0      12345     G    42     0     0     0   game
-    0      67890     C     7     0     0     0   helper
-    0          -     -     -     -     -     -   -
-"#;
-
-        let usage = AppModel::parse_nvidia_pmon_output(pmon);
-        assert_eq!(usage.get(&12345).copied(), Some(42.0));
-        assert_eq!(usage.get(&67890).copied(), Some(7.0));
-        assert!(!usage.contains_key(&0));
-    }
-
-    #[test]
-    fn parses_drm_engine_time_from_fdinfo() {
-        let fdinfo = r#"
-pos:	0
-flags:	02100002
-mnt_id:	34
-ino:	123456
-drm-driver:	amdgpu
-drm-engine-gfx:	12000000 ns
-drm-engine-compute:	8000000 ns
-"#;
-
-        assert_eq!(AppModel::parse_drm_engine_ns(fdinfo), Some(20_000_000));
-    }
-
-    #[test]
-    fn parses_drm_client_id_from_fdinfo() {
-        let fdinfo = r#"
-drm-driver:	amdgpu
-drm-client-id:	42
-drm-engine-gfx:	1000 ns
-"#;
-
-        assert_eq!(AppModel::parse_drm_client_id(fdinfo), Some(42));
-    }
-
-    #[test]
-    fn parses_first_number_in_mixed_tokens() {
-        assert_eq!(AppModel::parse_first_u64("  12345 ns"), Some(12345));
-        assert_eq!(AppModel::parse_first_u64("\tvalue=6789ns"), Some(6789));
-        assert_eq!(AppModel::parse_first_u64("no-number"), None);
     }
 }

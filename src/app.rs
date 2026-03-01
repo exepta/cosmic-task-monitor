@@ -42,12 +42,21 @@ fn table_cell_style(theme: &cosmic::Theme) -> widget::container::Style {
 
 fn table_row_button_style() -> theme::Button {
     theme::Button::Custom {
-        active: Box::new(|_focused, _theme| widget::button::Style::new()),
+        active: Box::new(|_focused, _theme| {
+            let mut style = widget::button::Style::new();
+            style.border_width = 1.0;
+            style.border_color = Color::TRANSPARENT;
+            style.border_radius = 0.0.into();
+            style
+        }),
         hovered: Box::new(|_focused, theme| {
             let mut style = widget::button::Style::new();
             style.background = Some(Background::Color(
                 theme.current_container().component.hover.into(),
             ));
+            style.border_width = 1.0;
+            style.border_color = theme.cosmic().accent_color().into();
+            style.border_radius = 0.0.into();
             style
         }),
         pressed: Box::new(|_focused, theme| {
@@ -55,9 +64,18 @@ fn table_row_button_style() -> theme::Button {
             style.background = Some(Background::Color(
                 theme.current_container().component.hover.into(),
             ));
+            style.border_width = 1.0;
+            style.border_color = theme.cosmic().accent_color().into();
+            style.border_radius = 0.0.into();
             style
         }),
-        disabled: Box::new(|_theme| widget::button::Style::new()),
+        disabled: Box::new(|_theme| {
+            let mut style = widget::button::Style::new();
+            style.border_width = 1.0;
+            style.border_color = Color::TRANSPARENT;
+            style.border_radius = 0.0.into();
+            style
+        }),
     }
 }
 
@@ -69,7 +87,6 @@ struct ProcessEntry {
     icon_handle: Option<icon::Handle>,
     pid: u32,
     cpu_percent: f32,
-    gpu_percent: f32,
     rss_bytes: u64,
     threads: u32,
 }
@@ -112,7 +129,6 @@ enum LaunchCandidate {
 pub enum SortColumn {
     Name,
     Cpu,
-    Gpu,
     Pid,
     Ram,
     Threads,
@@ -122,6 +138,12 @@ pub enum SortColumn {
 enum SortDirection {
     Asc,
     Desc,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AppsViewMode {
+    List,
+    Tile,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -142,9 +164,7 @@ pub struct AppModel {
     steam_apps_by_id: HashMap<String, SteamAppMeta>,
     process_entries: Vec<ProcessEntry>,
     selected_process: Option<SelectedProcess>,
-    gpu_engine_ns_by_pid: HashMap<u32, u64>,
-    last_gpu_usage_by_pid: HashMap<u32, f32>,
-    last_gpu_sample_at: Option<Instant>,
+    apps_view_mode: AppsViewMode,
     sort_state: SortState,
 }
 
@@ -154,6 +174,7 @@ pub enum Message {
     ToggleContextPage(ContextPage),
     UpdateConfig(Config),
     RefreshProcesses,
+    SetAppsViewMode(AppsViewMode),
     ToggleSort(SortColumn),
     OpenProcessMenu {
         app_id: String,
@@ -174,7 +195,7 @@ impl cosmic::Application for AppModel {
     type Flags = ();
     type Message = Message;
 
-    const APP_ID: &'static str = "dev.mmurphy.Test";
+    const APP_ID: &'static str = "com.github.exepta.cosmic-task-monitor";
 
     fn core(&self) -> &cosmic::Core {
         &self.core
@@ -230,9 +251,7 @@ impl cosmic::Application for AppModel {
             steam_apps_by_id: HashMap::new(),
             process_entries: Vec::new(),
             selected_process: None,
-            gpu_engine_ns_by_pid: HashMap::new(),
-            last_gpu_usage_by_pid: HashMap::new(),
-            last_gpu_sample_at: None,
+            apps_view_mode: AppsViewMode::List,
             sort_state: SortState {
                 column: SortColumn::Ram,
                 direction: SortDirection::Desc,
@@ -244,13 +263,32 @@ impl cosmic::Application for AppModel {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
-        let menu_bar = menu::bar(vec![menu::Tree::with_children(
-            menu::root(fl!("view")).apply(Element::from),
-            menu::items(
-                &self.key_binds,
-                vec![menu::Item::Button(fl!("about"), None, MenuAction::About)],
+        let menu_bar = menu::bar(vec![
+            menu::Tree::with_children(
+                menu::root(fl!("view")).apply(Element::from),
+                menu::items(
+                    &self.key_binds,
+                    vec![
+                        menu::Item::Button(fl!("list"), None, MenuAction::ViewList),
+                        menu::Item::Button(fl!("tile"), None, MenuAction::ViewTile),
+                    ],
+                ),
             ),
-        )]);
+            menu::Tree::with_children(
+                menu::root(fl!("settings")).apply(Element::from),
+                menu::items(
+                    &self.key_binds,
+                    vec![menu::Item::Button(fl!("about"), None, MenuAction::About)],
+                ),
+            ),
+            menu::Tree::with_children(
+                menu::root(fl!("help")).apply(Element::from),
+                menu::items(
+                    &self.key_binds,
+                    vec![menu::Item::Button(fl!("about"), None, MenuAction::About)],
+                ),
+            ),
+        ]);
 
         vec![menu_bar.into()]
     }
@@ -343,8 +381,8 @@ impl cosmic::Application for AppModel {
                     .align_y(Alignment::Center)
                     .spacing(space_s);
 
-                let table_header =
-                    widget::row::with_capacity(6)
+                let sort_controls =
+                    widget::row::with_capacity(5)
                         .push(
                             widget::container(
                                 widget::button::custom(
@@ -363,18 +401,6 @@ impl cosmic::Application for AppModel {
                                     self.header_button_content(fl!("table-cpu"), SortColumn::Cpu),
                                 )
                                 .on_press(Message::ToggleSort(SortColumn::Cpu))
-                                .width(Length::Fill),
-                            )
-                            .padding(10)
-                            .class(theme::Container::custom(table_cell_style))
-                            .width(Length::FillPortion(2)),
-                        )
-                        .push(
-                            widget::container(
-                                widget::button::custom(
-                                    self.header_button_content(fl!("table-gpu"), SortColumn::Gpu),
-                                )
-                                .on_press(Message::ToggleSort(SortColumn::Gpu))
                                 .width(Length::Fill),
                             )
                             .padding(10)
@@ -420,7 +446,7 @@ impl cosmic::Application for AppModel {
                         )
                         .spacing(0);
 
-                let rows = self.process_entries.iter().fold(
+                let list_rows = self.process_entries.iter().fold(
                     widget::column::with_capacity(self.process_entries.len()),
                     |column, process| {
                         let name_cell_content: Element<'_, Message> =
@@ -437,7 +463,7 @@ impl cosmic::Application for AppModel {
 
                         column.push(
                             widget::button::custom(
-                                widget::row::with_capacity(6)
+                                widget::row::with_capacity(5)
                                     .push(
                                         widget::container(name_cell_content)
                                             .padding(10)
@@ -448,15 +474,6 @@ impl cosmic::Application for AppModel {
                                         widget::container(widget::text(format!(
                                             "{:.1}%",
                                             process.cpu_percent
-                                        )))
-                                        .padding(10)
-                                        .class(theme::Container::custom(table_cell_style))
-                                        .width(Length::FillPortion(2)),
-                                    )
-                                    .push(
-                                        widget::container(widget::text(format!(
-                                            "{:.1}%",
-                                            process.gpu_percent
                                         )))
                                         .padding(10)
                                         .class(theme::Container::custom(table_cell_style))
@@ -499,13 +516,134 @@ impl cosmic::Application for AppModel {
                     },
                 );
 
-                widget::column::with_capacity(3)
-                    .push(header)
-                    .push(table_header)
-                    .push(widget::scrollable(rows).height(Length::Fill))
-                    .spacing(space_s)
-                    .height(Length::Fill)
-                    .into()
+                let page_content: Element<'_, Message> = match self.apps_view_mode {
+                    AppsViewMode::List => widget::column::with_capacity(3)
+                        .push(header)
+                        .push(sort_controls)
+                        .push(widget::scrollable(list_rows).height(Length::Fill))
+                        .spacing(space_s)
+                        .height(Length::Fill)
+                        .into(),
+                    AppsViewMode::Tile => {
+                        let tile_grid = widget::responsive(move |size| {
+                            let spacing = space_s as f32;
+                            let min_tile_width = 320.0;
+                            let tile_columns = (((size.width + spacing)
+                                / (min_tile_width + spacing))
+                                .floor() as usize)
+                                .clamp(1, 4);
+
+                            let mut tile_rows = widget::column::with_capacity(
+                                (self.process_entries.len() + tile_columns - 1) / tile_columns,
+                            )
+                            .spacing(space_s)
+                            .width(Length::Fill);
+
+                            for chunk in self.process_entries.chunks(tile_columns) {
+                                let mut tile_row = widget::row::with_capacity(tile_columns)
+                                    .spacing(space_s)
+                                    .width(Length::Fill);
+
+                                for process in chunk {
+                                    let icon_content: Element<'_, Message> =
+                                        if let Some(icon_handle) = process.icon_handle.as_ref() {
+                                            widget::icon::icon(icon_handle.clone()).size(56).into()
+                                        } else {
+                                            widget::container(widget::text(""))
+                                                .width(Length::Fixed(56.0))
+                                                .into()
+                                        };
+
+                                    let details = widget::column::with_capacity(5)
+                                        .push(
+                                            widget::text(process.display_name.as_str()).size(20),
+                                        )
+                                        .push(
+                                            widget::text(format!(
+                                                "{}: {}",
+                                                fl!("table-pid"),
+                                                process.pid
+                                            ))
+                                            .size(12),
+                                        )
+                                        .push(widget::text(format!(
+                                            "{}: {:.1}%",
+                                            fl!("table-cpu"),
+                                            process.cpu_percent
+                                        ))
+                                        .size(12))
+                                        .push(widget::text(format!(
+                                            "{}: {}",
+                                            fl!("table-ram"),
+                                            Self::format_rss(process.rss_bytes)
+                                        ))
+                                        .size(12))
+                                        .push(
+                                            widget::text(format!(
+                                                "{}: {}",
+                                                fl!("table-threads"),
+                                                process.threads
+                                            ))
+                                            .size(12),
+                                        )
+                                        .spacing(6)
+                                        .width(Length::Fill);
+
+                                    let tile_content = widget::container(
+                                        widget::row::with_capacity(2)
+                                            .push(
+                                                widget::container(icon_content)
+                                                    .center_x(Length::Fixed(56.0)),
+                                            )
+                                            .push(details)
+                                            .spacing(25)
+                                            .align_y(Alignment::Center)
+                                            .width(Length::Fill),
+                                    )
+                                    .padding(12)
+                                    .class(theme::Container::custom(table_cell_style))
+                                    .width(Length::Fill);
+
+                                    let tile_button = widget::button::custom(tile_content)
+                                        .on_press(Message::OpenProcessMenu {
+                                            app_id: process.app_id.clone(),
+                                            display_name: process.display_name.clone(),
+                                            pid: process.pid,
+                                        })
+                                        .padding(0)
+                                        .class(table_row_button_style())
+                                        .width(Length::Fill);
+
+                                    tile_row = tile_row.push(
+                                        widget::container(tile_button).width(Length::FillPortion(1)),
+                                    );
+                                }
+
+                                for _ in chunk.len()..tile_columns {
+                                    tile_row = tile_row.push(
+                                        widget::container(widget::text(""))
+                                            .width(Length::FillPortion(1))
+                                            .height(Length::Shrink),
+                                    );
+                                }
+
+                                tile_rows = tile_rows.push(tile_row);
+                            }
+
+                            widget::scrollable(tile_rows).height(Length::Fill).into()
+                        });
+
+                        widget::column::with_capacity(3)
+                            .push(header)
+                            .push(sort_controls)
+                            .push(tile_grid)
+                            .spacing(space_s)
+                            .height(Length::Fill)
+                            .into()
+                    }
+                };
+
+                page_content
             }
 
             Page::Page2 => {
@@ -566,6 +704,7 @@ impl cosmic::Application for AppModel {
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
             Message::RefreshProcesses => self.refresh_processes(),
+            Message::SetAppsViewMode(mode) => self.apps_view_mode = mode,
             Message::ToggleSort(column) => self.toggle_sort(column),
             Message::OpenProcessMenu {
                 app_id,
@@ -650,6 +789,8 @@ pub enum ContextPage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuAction {
     About,
+    ViewList,
+    ViewTile,
 }
 
 impl menu::action::MenuAction for MenuAction {
@@ -658,6 +799,8 @@ impl menu::action::MenuAction for MenuAction {
     fn message(&self) -> Self::Message {
         match self {
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
+            MenuAction::ViewList => Message::SetAppsViewMode(AppsViewMode::List),
+            MenuAction::ViewTile => Message::SetAppsViewMode(AppsViewMode::Tile),
         }
     }
 }
