@@ -20,8 +20,116 @@ impl AppModel {
 
     pub(super) fn refresh_processes(&mut self) {
         self.desktop_apps_by_exec = Self::load_desktop_app_map();
+        self.disks.refresh(true);
+        let mut read_by_disk: HashMap<String, u64> = HashMap::new();
+        let mut write_by_disk: HashMap<String, u64> = HashMap::new();
+        for disk in self.disks.list() {
+            let partition_name = disk.name().to_string_lossy().to_string();
+            let disk_key = Self::disk_device_key(&partition_name);
+            let usage = disk.usage();
+            *read_by_disk.entry(disk_key.clone()).or_insert(0) += usage.read_bytes;
+            *write_by_disk.entry(disk_key).or_insert(0) += usage.written_bytes;
+        }
+        let refresh_secs = PROCESS_REFRESH_INTERVAL.as_secs_f32().max(0.001);
+        for (disk_key, read_bytes) in &read_by_disk {
+            let write_bytes = write_by_disk.get(disk_key).copied().unwrap_or(0);
+            let read_mib_s = (*read_bytes as f32 / (1024.0 * 1024.0)) / refresh_secs;
+            let write_mib_s = (write_bytes as f32 / (1024.0 * 1024.0)) / refresh_secs;
+
+            let read_history = self.disk_read_history.entry(disk_key.clone()).or_default();
+            read_history.push(read_mib_s.max(0.0));
+            if read_history.len() > PERFORMANCE_HISTORY_POINTS {
+                read_history.remove(0);
+            }
+
+            let write_history = self.disk_write_history.entry(disk_key.clone()).or_default();
+            write_history.push(write_mib_s.max(0.0));
+            if write_history.len() > PERFORMANCE_HISTORY_POINTS {
+                write_history.remove(0);
+            }
+        }
+        self.disk_read_history
+            .retain(|key, _| read_by_disk.contains_key(key));
+        self.disk_write_history
+            .retain(|key, _| write_by_disk.contains_key(key));
+
+        let disk_names = Self::list_primary_disks();
+        let mut known_disks = HashSet::with_capacity(disk_names.len());
+        for disk_name in disk_names {
+            known_disks.insert(disk_name.clone());
+            let Some(current) = Self::read_disk_io_snapshot(&disk_name) else {
+                continue;
+            };
+
+            let runtime = if let Some(previous) = self.disk_previous_snapshots.get(&disk_name) {
+                let delta_reads = current
+                    .reads_completed
+                    .saturating_sub(previous.reads_completed);
+                let delta_writes = current
+                    .writes_completed
+                    .saturating_sub(previous.writes_completed);
+                let delta_ops = delta_reads + delta_writes;
+                let delta_io_time = current.io_time_ms.saturating_sub(previous.io_time_ms);
+                let delta_weighted = current
+                    .weighted_io_time_ms
+                    .saturating_sub(previous.weighted_io_time_ms);
+
+                let active_time_percent =
+                    (delta_io_time as f32 / (refresh_secs * 1000.0) * 100.0).clamp(0.0, 100.0);
+                let avg_response_ms = if delta_ops > 0 {
+                    (delta_weighted as f32 / delta_ops as f32).max(0.0)
+                } else {
+                    0.0
+                };
+
+                DiskRuntimeInfo {
+                    active_time_percent,
+                    avg_response_ms,
+                }
+            } else {
+                DiskRuntimeInfo::default()
+            };
+
+            self.disk_runtime_info.insert(disk_name.clone(), runtime);
+            self.disk_previous_snapshots.insert(disk_name, current);
+        }
+        self.disk_runtime_info
+            .retain(|key, _| known_disks.contains(key));
+        self.disk_previous_snapshots
+            .retain(|key, _| known_disks.contains(key));
+
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
+        let core_usages = self
+            .system
+            .cpus()
+            .iter()
+            .map(|cpu| cpu.cpu_usage().clamp(0.0, 100.0))
+            .collect::<Vec<_>>();
+        if self.cpu_usage_history_per_core.len() != core_usages.len() {
+            self.cpu_usage_history_per_core = vec![Vec::new(); core_usages.len()];
+        }
+        for (history, usage) in self
+            .cpu_usage_history_per_core
+            .iter_mut()
+            .zip(core_usages.iter().copied())
+        {
+            history.push(usage);
+            if history.len() > PERFORMANCE_HISTORY_POINTS {
+                history.remove(0);
+            }
+        }
+        let total_memory = self.system.total_memory();
+        let used_memory = self.system.used_memory().min(total_memory);
+        let ram_usage = if total_memory > 0 {
+            (used_memory as f32 / total_memory as f32 * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        self.ram_usage_history.push(ram_usage);
+        if self.ram_usage_history.len() > PERFORMANCE_HISTORY_POINTS {
+            self.ram_usage_history.remove(0);
+        }
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
