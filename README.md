@@ -3,6 +3,13 @@
 </p>
 <h1 align="center">Cosmic Task Monitor</h1>
 
+> [!IMPORTANT]
+> By using this software, you fully accept all responsibility for any data loss or corruption caused whilst using this software.
+
+> [!WARNING]
+> This software is currently in early beta, and has not been tested against many drive type, partition type, and partition scheme combinations yet.
+---
+
 Monitor running applications and system performance.
 
 ## Use Without IDE

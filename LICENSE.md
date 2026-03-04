@@ -1,8 +1,5 @@
 # Mozilla Public License 2.0
 
-Mozilla Public License Version 2.0
-==================================
-
 1. Definitions
 --------------
 
