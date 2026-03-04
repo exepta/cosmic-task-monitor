@@ -1,12 +1,11 @@
 [Desktop Entry]
 Name=Cosmic Task Monitor
-Comment=An application for look your system load isn a good and awesome way
+Comment=Monitor running applications and system performance
 Type=Application
 Icon=com.github.exepta.cosmic-task-monitor
 Exec=cosmic-task-monitor %F
 Terminal=false
 StartupNotify=true
 StartupWMClass=com.github.exepta.cosmic-task-monitor
-Categories=COSMIC
-Keywords=COSMIC
-MimeType=
+Categories=System;Monitor;Utility;COSMIC;
+Keywords=System;Monitor;Performance;Task;COSMIC;

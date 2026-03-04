@@ -1,26 +1,62 @@
-# Cosmic Task Monitor
+<p align="center">
+  <img src="resources/icons/hicolor/scalable/apps/com.github.exepta.cosmic-task-monitor.svg" alt="Cosmic Task Monitor icon" width="128" />
+</p>
+<h1 align="center">Cosmic Task Monitor</h1>
 
-An application for look your system load isn a good and awesome way
+Monitor running applications and system performance.
 
-## Installation
+## Use Without IDE
 
-A [justfile](./justfile) is included by default for the [casey/just][just] command runner.
+### Quick run (terminal only)
 
-- `just` builds the application with the default `just build-release` recipe
-- `just run` builds and runs the application
-- `just install` installs the project into the system
+```sh
+cargo build --release
+./target/release/cosmic-task-monitor
+```
+
+### Install for current user (desktop launcher + icon)
+
+```sh
+./scripts/install-user.sh
+```
+
+This installs to `~/.local`:
+- binary: `~/.local/bin/cosmic-task-monitor`
+- desktop entry: `~/.local/share/applications/com.github.exepta.cosmic-task-monitor.desktop`
+- icon: `~/.local/share/icons/hicolor/scalable/apps/com.github.exepta.cosmic-task-monitor.svg`
+
+Alternative with `just`:
+
+```sh
+just install-user
+```
+
+### System-wide install
+
+```sh
+just install
+```
+
+## Development Commands
+
+A [justfile](./justfile) is included for the [casey/just][just] runner.
+
+- `just` builds the app (`build-release`)
+- `just run` builds and runs the app
+- `just install` installs the project system-wide
+- `just install-user` installs into `~/.local`
 - `just vendor` creates a vendored tarball
-- `just build-vendored` compiles with vendored dependencies from that tarball
-- `just check` runs clippy on the project to check for linter warnings
-- `just check-json` can be used by IDEs that support LSP
+- `just build-vendored` compiles with vendored dependencies
+- `just check` runs `clippy`
+- `just check-json` emits JSON diagnostics for IDE/LSP
 
 ## Translators
 
-[Fluent][fluent] is used for localization of the software. Fluent's translation files are found in the [i18n directory](./i18n). New translations may copy the [English (en) localization](./i18n/en) of the project, rename `en` to the desired [ISO 639-1 language code][iso-codes], and then translations can be provided for each [message identifier][fluent-guide]. If no translation is necessary, the message may be omitted.
+[Fluent][fluent] is used for localization. Translation files are in [i18n](./i18n).
 
 ## Packaging
 
-If packaging for a Linux distribution, vendor dependencies locally with the `vendor` rule, and build with the vendored sources using the `build-vendored` rule. When installing files, use the `rootdir` and `prefix` variables to change installation paths.
+For Linux distribution packaging:
 
 ```sh
 just vendor
@@ -28,17 +64,9 @@ just build-vendored
 just rootdir=debian/cosmic-task-monitor prefix=/usr install
 ```
 
-It is recommended to build a source tarball with the vendored dependencies, which can typically be done by running `just vendor` on the host system before it enters the build environment.
+## License
 
-## Developers
-
-Developers should install [rustup][rustup] and configure their editor to use [rust-analyzer][rust-analyzer]. To improve compilation times, disable LTO in the release profile, install the [mold][mold] linker, and configure [sccache][sccache] for use with Rust. The [mold][mold] linker will only improve link times if LTO is disabled.
+This project is licensed under [MPL-2.0](./LICENSE.md).
 
 [fluent]: https://projectfluent.org/
-[fluent-guide]: https://projectfluent.org/fluent/guide/hello.html
-[iso-codes]: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
 [just]: https://github.com/casey/just
-[rustup]: https://rustup.rs/
-[rust-analyzer]: https://rust-analyzer.github.io/
-[mold]: https://github.com/rui314/mold
-[sccache]: https://github.com/mozilla/sccache

@@ -4,9 +4,9 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MPL-2.0</project_license>
   <name>Cosmic Task Monitor</name>
-  <summary>An application for look your system load isn a good and awesome way</summary>
+  <summary>Monitor running applications and system performance</summary>
   <icon type="remote" width="64" height="64" scale="1">
-    https://github.com/exepta/cosmic-task-monitor/raw/main/resources/icons/hicolor/scalable/apps/icon.svg
+    https://github.com/exepta/cosmic-task-monitor/raw/main/resources/icons/hicolor/scalable/apps/com.github.exepta.cosmic-task-monitor.svg
   </icon>
   <url type="vcs-browser">https://github.com/exepta/cosmic-task-monitor</url>
   <launchable type="desktop-id">com.github.exepta.cosmic-task-monitor.desktop</launchable>
@@ -32,4 +32,3 @@
   </keywords>
   <content_rating type="oars-1.1" />
 </component>
-

@@ -130,6 +130,76 @@ impl AppModel {
         if self.ram_usage_history.len() > PERFORMANCE_HISTORY_POINTS {
             self.ram_usage_history.remove(0);
         }
+        let gpu_runtime = Self::read_gpu_runtime_info();
+        self.gpu_runtime_info = gpu_runtime.clone();
+
+        if let Some(gpu_usage) = gpu_runtime.utilization_percent {
+            self.gpu_usage_history.push(gpu_usage);
+            if self.gpu_usage_history.len() > PERFORMANCE_HISTORY_POINTS {
+                self.gpu_usage_history.remove(0);
+            }
+        }
+        if let (Some(vram_used), Some(vram_total)) =
+            (gpu_runtime.vram_used_bytes, gpu_runtime.vram_total_bytes)
+        {
+            if vram_total > 0 {
+                let vram_usage = (vram_used as f32 / vram_total as f32 * 100.0).clamp(0.0, 100.0);
+                self.gpu_vram_usage_history.push(vram_usage);
+                if self.gpu_vram_usage_history.len() > PERFORMANCE_HISTORY_POINTS {
+                    self.gpu_vram_usage_history.remove(0);
+                }
+            }
+        }
+        let active_networks = Self::list_active_network_interfaces();
+        self.network_interfaces = active_networks.clone();
+
+        let mut known_networks = HashSet::with_capacity(active_networks.len());
+        for interface in active_networks {
+            known_networks.insert(interface.name.clone());
+            let current = NetworkIoSnapshot {
+                rx_bytes: interface.rx_bytes,
+                tx_bytes: interface.tx_bytes,
+            };
+
+            let (rx_mib_s, tx_mib_s) =
+                if let Some(previous) = self.network_previous_snapshots.get(&interface.name) {
+                    let delta_rx = current.rx_bytes.saturating_sub(previous.rx_bytes);
+                    let delta_tx = current.tx_bytes.saturating_sub(previous.tx_bytes);
+                    (
+                        (delta_rx as f32 / (1024.0 * 1024.0)) / refresh_secs,
+                        (delta_tx as f32 / (1024.0 * 1024.0)) / refresh_secs,
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+
+            let rx_history = self
+                .network_rx_history
+                .entry(interface.name.clone())
+                .or_default();
+            rx_history.push(rx_mib_s.max(0.0));
+            if rx_history.len() > PERFORMANCE_HISTORY_POINTS {
+                rx_history.remove(0);
+            }
+
+            let tx_history = self
+                .network_tx_history
+                .entry(interface.name.clone())
+                .or_default();
+            tx_history.push(tx_mib_s.max(0.0));
+            if tx_history.len() > PERFORMANCE_HISTORY_POINTS {
+                tx_history.remove(0);
+            }
+
+            self.network_previous_snapshots
+                .insert(interface.name.clone(), current);
+        }
+        self.network_rx_history
+            .retain(|key, _| known_networks.contains(key));
+        self.network_tx_history
+            .retain(|key, _| known_networks.contains(key));
+        self.network_previous_snapshots
+            .retain(|key, _| known_networks.contains(key));
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
@@ -396,139 +466,6 @@ impl AppModel {
             }
         }
         None
-    }
-
-    fn steam_app_id_for_process(
-        process: &sysinfo::Process,
-        processes: &HashMap<Pid, sysinfo::Process>,
-    ) -> Option<String> {
-        if let Some(app_id) = Self::extract_steam_app_id_from_process(process) {
-            return Some(app_id);
-        }
-
-        let mut visited = HashSet::new();
-        let mut parent = process.parent();
-        let mut depth = 0usize;
-
-        while let Some(parent_pid) = parent {
-            if depth >= 12 || !visited.insert(parent_pid) {
-                break;
-            }
-
-            let Some(parent_process) = processes.get(&parent_pid) else {
-                break;
-            };
-
-            if let Some(app_id) = Self::extract_steam_app_id_from_process(parent_process) {
-                return Some(app_id);
-            }
-
-            parent = parent_process.parent();
-            depth += 1;
-        }
-
-        None
-    }
-
-    fn extract_steam_app_id_from_process(process: &sysinfo::Process) -> Option<String> {
-        if let Some(app_id) = Self::extract_steam_app_id(process.name().to_string_lossy().as_ref())
-        {
-            return Some(app_id);
-        }
-
-        if let Some(cmd0) = process.cmd().first() {
-            if let Some(app_id) = Self::extract_steam_app_id(cmd0.to_string_lossy().as_ref()) {
-                return Some(app_id);
-            }
-        }
-
-        if !process.cmd().is_empty() {
-            let cmdline = process
-                .cmd()
-                .iter()
-                .map(|part| part.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if let Some(app_id) = Self::extract_steam_app_id(&cmdline) {
-                return Some(app_id);
-            }
-
-            for arg in process.cmd() {
-                if let Some(app_id) = Self::extract_steam_app_id(arg.to_string_lossy().as_ref()) {
-                    return Some(app_id);
-                }
-            }
-        }
-
-        None
-    }
-
-    fn extract_steam_app_id(value: &str) -> Option<String> {
-        if value.trim().is_empty() {
-            return None;
-        }
-
-        let lower = value.to_ascii_lowercase();
-        for marker in ["appid=", "gameid=", "-gameid", "steam_app_", "rungameid/"] {
-            if let Some(app_id) = Self::extract_decimal_after_marker(value, &lower, marker) {
-                return Some(app_id);
-            }
-        }
-
-        None
-    }
-
-    fn extract_decimal_after_marker(original: &str, lower: &str, marker: &str) -> Option<String> {
-        let mut offset = 0usize;
-        while let Some(found) = lower[offset..].find(marker) {
-            let start = offset + found + marker.len();
-            if let Some(app_id) = Self::extract_decimal_from(original, start) {
-                return Some(app_id);
-            }
-            offset = start;
-        }
-        None
-    }
-
-    fn extract_decimal_from(value: &str, mut index: usize) -> Option<String> {
-        let bytes = value.as_bytes();
-        while index < bytes.len() {
-            let c = bytes[index];
-            if c.is_ascii_digit() {
-                break;
-            }
-            if matches!(c, b' ' | b'=' | b':' | b'/' | b'-' | b'"' | b'\'') {
-                index += 1;
-                continue;
-            }
-            return None;
-        }
-
-        let start = index;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-
-        if start == index {
-            return None;
-        }
-
-        let app_id = &value[start..index];
-        if app_id == "0" {
-            None
-        } else {
-            Some(app_id.to_string())
-        }
-    }
-
-    fn load_steam_app_meta(app_id: &str, default_icon: Option<icon::Handle>) -> SteamAppMeta {
-        let name = Self::steam_manifest_name(app_id)
-            .unwrap_or_else(|| crate::fl!("steam-app-fallback", app_id = app_id));
-        let icon_handle = Self::steam_icon_path(app_id)
-            .map(icon::from_path)
-            .or(default_icon);
-
-        SteamAppMeta { name, icon_handle }
     }
 
     pub(super) fn restart_selected_application(&mut self) {
@@ -872,227 +809,6 @@ impl AppModel {
 
         Self::steam_app_id_for_process(process, processes)
             .map(|steam_app_id| format!("steam-app-{steam_app_id}"))
-    }
-
-    fn steam_manifest_name(app_id: &str) -> Option<String> {
-        for library_root in Self::steam_library_roots() {
-            let steamapps = Self::steamapps_dir(&library_root);
-            let manifest = steamapps.join(format!("appmanifest_{app_id}.acf"));
-            if !manifest.is_file() {
-                continue;
-            }
-
-            if let Ok(content) = fs::read_to_string(&manifest) {
-                if let Some(name) = Self::acf_value(&content, "name") {
-                    let trimmed = name.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    fn steam_install_dir(app_id: &str) -> Option<PathBuf> {
-        for library_root in Self::steam_library_roots() {
-            let steamapps = Self::steamapps_dir(&library_root);
-            let manifest = steamapps.join(format!("appmanifest_{app_id}.acf"));
-            if !manifest.is_file() {
-                continue;
-            }
-
-            let Ok(content) = fs::read_to_string(&manifest) else {
-                continue;
-            };
-
-            let Some(install_dir) = Self::acf_value(&content, "installdir") else {
-                continue;
-            };
-
-            let path = steamapps.join("common").join(install_dir);
-            if path.exists() {
-                return Some(path);
-            }
-        }
-
-        None
-    }
-
-    fn steam_icon_path(app_id: &str) -> Option<PathBuf> {
-        for steam_root in Self::steam_root_paths() {
-            let app_dir = steam_root
-                .join("appcache")
-                .join("librarycache")
-                .join(app_id);
-            if !app_dir.is_dir() {
-                continue;
-            }
-
-            if let Some(path) = Self::preferred_icon_path_in_dir(&app_dir) {
-                return Some(path);
-            }
-
-            if let Ok(entries) = fs::read_dir(&app_dir) {
-                let mut nested_dirs = entries
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.path())
-                    .filter(|path| path.is_dir())
-                    .collect::<Vec<_>>();
-                nested_dirs.sort();
-
-                for nested in nested_dirs {
-                    if let Some(path) = Self::preferred_icon_path_in_dir(&nested) {
-                        return Some(path);
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    fn preferred_icon_path_in_dir(dir: &Path) -> Option<PathBuf> {
-        for name in ["logo.png", "library_600x900.jpg", "library_header.jpg"] {
-            let path = dir.join(name);
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-
-        let mut fallback = fs::read_dir(dir)
-            .ok()?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_file()
-                    && path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext| {
-                            matches!(
-                                ext.to_ascii_lowercase().as_str(),
-                                "png" | "jpg" | "jpeg" | "webp" | "svg"
-                            )
-                        })
-                        .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
-        fallback.sort();
-        fallback.into_iter().next()
-    }
-
-    fn steam_root_paths() -> Vec<PathBuf> {
-        let mut candidates = Vec::new();
-
-        if let Ok(compat_root) = env::var("STEAM_COMPAT_CLIENT_INSTALL_PATH") {
-            let path = PathBuf::from(compat_root);
-            if path.is_dir() {
-                candidates.push(path);
-            }
-        }
-
-        if let Ok(home) = env::var("HOME") {
-            let local_share = PathBuf::from(&home)
-                .join(".local")
-                .join("share")
-                .join("Steam");
-            if local_share.is_dir() {
-                candidates.push(local_share);
-            }
-
-            let legacy = PathBuf::from(home).join(".steam").join("steam");
-            if legacy.is_dir() {
-                candidates.push(legacy);
-            }
-        }
-
-        let mut seen = HashSet::new();
-        let mut unique = Vec::new();
-        for path in candidates {
-            let key = path.to_string_lossy().to_string();
-            if seen.insert(key) {
-                unique.push(path);
-            }
-        }
-        unique
-    }
-
-    fn steam_library_roots() -> Vec<PathBuf> {
-        let mut roots = Vec::new();
-        for steam_root in Self::steam_root_paths() {
-            roots.push(steam_root.clone());
-            let libraryfolders = steam_root.join("steamapps").join("libraryfolders.vdf");
-            if let Ok(content) = fs::read_to_string(libraryfolders) {
-                roots.extend(Self::steam_library_roots_from_vdf(&content));
-            }
-        }
-
-        let mut seen = HashSet::new();
-        let mut unique = Vec::new();
-        for path in roots {
-            if !path.is_dir() {
-                continue;
-            }
-            let key = path.to_string_lossy().to_string();
-            if seen.insert(key) {
-                unique.push(path);
-            }
-        }
-        unique
-    }
-
-    fn steam_library_roots_from_vdf(vdf: &str) -> Vec<PathBuf> {
-        let mut roots = Vec::new();
-        for line in vdf.lines() {
-            let Some((key, value)) = Self::quoted_kv(line) else {
-                continue;
-            };
-            if key != "path" {
-                continue;
-            }
-
-            let unescaped = value.replace("\\\\", "\\");
-            roots.push(PathBuf::from(unescaped));
-        }
-        roots
-    }
-
-    fn steamapps_dir(root: &Path) -> PathBuf {
-        if root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("steamapps"))
-        {
-            root.to_path_buf()
-        } else {
-            root.join("steamapps")
-        }
-    }
-
-    fn acf_value(content: &str, key: &str) -> Option<String> {
-        for line in content.lines() {
-            let Some((line_key, line_value)) = Self::quoted_kv(line) else {
-                continue;
-            };
-            if line_key.eq_ignore_ascii_case(key) {
-                return Some(line_value);
-            }
-        }
-        None
-    }
-
-    fn quoted_kv(line: &str) -> Option<(String, String)> {
-        let mut parts = line.split('"');
-        let _before_key = parts.next()?;
-        let key = parts.next()?.trim();
-        let _between = parts.next()?;
-        let value = parts.next()?.trim();
-        if key.is_empty() {
-            return None;
-        }
-        Some((key.to_string(), value.to_string()))
     }
 
     fn process_candidate_keys(process: &sysinfo::Process) -> Vec<String> {

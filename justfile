@@ -16,6 +16,7 @@ appdata := appid + '.metainfo.xml'
 desktop := appid + '.desktop'
 # Application's icon.
 icon-svg := appid + '.svg'
+icon-src := 'resources' / 'icons' / 'hicolor' / 'scalable' / 'apps' / icon-svg
 
 # Install destinations
 base-dir := absolute_path(clean(rootdir / prefix))
@@ -60,16 +61,17 @@ check-json: (check '--message-format=json')
 run *args:
     env RUST_BACKTRACE=full cargo run --release {{args}}
 
-# Installs files
-install:
-    install -Dm0755 {{ cargo-target-dir / 'release' / name }} {{bin-dst}}
-    install -Dm0644 {{ 'resources' / desktop }} {{desktop-dst}}
-    install -Dm0644 {{ 'resources' / appdata }} {{appdata-dst}}
-    install -Dm0644 {{ 'resources' / 'icons' / 'hicolor' / 'scalable' / 'apps' / 'icon.svg' }} {{icon-svg-dst}}
+# Installs files (system-wide by default)
+install: build-release
+    ./scripts/install-system.sh "{{rootdir}}" "{{prefix}}" "{{cargo-target-dir}}" "{{name}}" "{{appid}}"
+
+# Installs the app into the current user's local prefix (~/.local)
+install-user:
+    ./scripts/install-user.sh
 
 # Uninstalls installed files
 uninstall:
-    rm {{bin-dst}} {{desktop-dst}} {{icon-svg-dst}}
+    rm {{bin-dst}} {{desktop-dst}} {{appdata-dst}} {{icon-svg-dst}}
 
 # Vendor dependencies locally
 vendor:
