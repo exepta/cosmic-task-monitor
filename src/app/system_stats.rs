@@ -1448,6 +1448,7 @@ impl AppModel {
                 ))
                 .width(Length::FillPortion(1)),
             )
+            .spacing(20)
             .width(Length::Fill);
 
         let stats_col_1 = widget::column::with_capacity(3)

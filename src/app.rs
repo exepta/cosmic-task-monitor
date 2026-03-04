@@ -36,6 +36,7 @@ const NETWORK_ACCENT: Color = Color::from_rgb(81.0 / 255.0, 150.0 / 255.0, 214.0
 const DISK_ACCENT: Color = Color::from_rgb(197.0 / 255.0, 196.0 / 255.0, 67.0 / 255.0);
 
 mod apps;
+mod autostart;
 mod process;
 mod steam_helper;
 mod system_stats;
@@ -90,16 +91,76 @@ fn table_row_button_style() -> theme::Button {
     }
 }
 
+fn section_toggle_button_style() -> theme::Button {
+    theme::Button::Custom {
+        active: Box::new(|_focused, _theme| {
+            let mut style = widget::button::Style::new();
+            style.border_width = 0.0;
+            style.border_color = Color::TRANSPARENT;
+            style.border_radius = 0.0.into();
+            style
+        }),
+        hovered: Box::new(|_focused, theme| {
+            let mut style = widget::button::Style::new();
+            style.background = Some(Background::Color(
+                theme.current_container().component.hover.into(),
+            ));
+            style.border_width = 0.0;
+            style.border_color = Color::TRANSPARENT;
+            style.border_radius = 0.0.into();
+            style
+        }),
+        pressed: Box::new(|_focused, theme| {
+            let mut style = widget::button::Style::new();
+            style.background = Some(Background::Color(
+                theme.current_container().component.hover.into(),
+            ));
+            style.border_width = 0.0;
+            style.border_color = Color::TRANSPARENT;
+            style.border_radius = 0.0.into();
+            style
+        }),
+        disabled: Box::new(|_theme| {
+            let mut style = widget::button::Style::new();
+            style.border_width = 0.0;
+            style.border_color = Color::TRANSPARENT;
+            style.border_radius = 0.0.into();
+            style
+        }),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ProcessEntry {
     app_id: String,
     name: String,
     display_name: String,
+    is_background: bool,
     icon_handle: Option<icon::Handle>,
     pid: u32,
     cpu_percent: f32,
     rss_bytes: u64,
     threads: u32,
+}
+
+#[derive(Debug, Clone)]
+struct AutostartEntry {
+    app_id: String,
+    desktop_file_name: String,
+    autostart_path: String,
+    name: String,
+    exec: String,
+    is_background: bool,
+    icon_handle: Option<icon::Handle>,
+}
+
+#[derive(Debug, Clone)]
+struct AutostartAddOption {
+    app_id: String,
+    desktop_entry_id: Option<String>,
+    name: String,
+    exec: Option<String>,
+    desktop_entry_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -283,6 +344,14 @@ pub struct AppModel {
     process_entries: Vec<ProcessEntry>,
     selected_process: Option<SelectedProcess>,
     apps_view_mode: AppsViewMode,
+    apps_desktop_expanded: bool,
+    apps_background_expanded: bool,
+    autostart_entries: Vec<AutostartEntry>,
+    autostart_add_options: Vec<AutostartAddOption>,
+    autostart_modal_open: bool,
+    autostart_modal_selected_option: Option<usize>,
+    autostart_desktop_expanded: bool,
+    autostart_background_expanded: bool,
     performance_view_mode: PerformanceViewMode,
     cpu_usage_history_per_core: Vec<Vec<f32>>,
     ram_usage_history: Vec<f32>,
@@ -308,6 +377,14 @@ pub enum Message {
     UpdateConfig(Config),
     RefreshProcesses,
     SetAppsViewMode(AppsViewMode),
+    ToggleAppsDesktopSection,
+    ToggleAppsBackgroundSection,
+    OpenAutostartModal,
+    CloseAutostartModal,
+    SelectAutostartModalOption(usize),
+    ConfirmAutostartModal,
+    ToggleAutostartDesktopSection,
+    ToggleAutostartBackgroundSection,
     SetPerformanceViewMode(PerformanceViewMode),
     MountDisk(String),
     UnmountDisk(String),
@@ -354,8 +431,13 @@ impl cosmic::Application for AppModel {
             .activate();
 
         nav.insert()
-            .text(fl!("nav-performance"))
+            .text(fl!("nav-autostart"))
             .data::<Page>(Page::Page2)
+            .icon(icon::from_name("system-run-symbolic"));
+
+        nav.insert()
+            .text(fl!("nav-performance"))
+            .data::<Page>(Page::Page3)
             .icon(icon::from_name("utilities-system-monitor-symbolic"));
 
         let about = About::default()
@@ -383,6 +465,14 @@ impl cosmic::Application for AppModel {
             process_entries: Vec::new(),
             selected_process: None,
             apps_view_mode: AppsViewMode::List,
+            apps_desktop_expanded: true,
+            apps_background_expanded: false,
+            autostart_entries: Vec::new(),
+            autostart_add_options: Vec::new(),
+            autostart_modal_open: false,
+            autostart_modal_selected_option: None,
+            autostart_desktop_expanded: true,
+            autostart_background_expanded: false,
             performance_view_mode: PerformanceViewMode::Cpu,
             cpu_usage_history_per_core: Vec::new(),
             ram_usage_history: Vec::new(),
@@ -404,6 +494,7 @@ impl cosmic::Application for AppModel {
             },
         };
 
+        app.refresh_autostart_state();
         let command = app.update_title();
         (app, command)
     }
@@ -475,9 +566,15 @@ impl cosmic::Application for AppModel {
                         widget::text(fl!("process-none-selected")).into()
                     };
 
-                context_drawer::context_drawer(content, Message::CloseProcessMenu).title(title)
+                let padded_content = widget::container(content).padding([0, 20, 0, 0]);
+                context_drawer::context_drawer(padded_content, Message::CloseProcessMenu)
+                    .title(title)
             }
         })
+    }
+
+    fn dialog(&self) -> Option<Element<'_, Self::Message>> {
+        self.autostart_add_dialog()
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
@@ -547,6 +644,26 @@ impl cosmic::Application for AppModel {
         match message {
             Message::RefreshProcesses => self.refresh_processes(),
             Message::SetAppsViewMode(mode) => self.apps_view_mode = mode,
+            Message::ToggleAppsDesktopSection => {
+                self.apps_desktop_expanded = !self.apps_desktop_expanded;
+            }
+            Message::ToggleAppsBackgroundSection => {
+                self.apps_background_expanded = !self.apps_background_expanded;
+            }
+            Message::OpenAutostartModal => self.open_autostart_modal(),
+            Message::CloseAutostartModal => self.autostart_modal_open = false,
+            Message::SelectAutostartModalOption(index) => {
+                self.autostart_modal_selected_option = Some(index);
+            }
+            Message::ConfirmAutostartModal => {
+                self.confirm_autostart_modal();
+            }
+            Message::ToggleAutostartDesktopSection => {
+                self.autostart_desktop_expanded = !self.autostart_desktop_expanded;
+            }
+            Message::ToggleAutostartBackgroundSection => {
+                self.autostart_background_expanded = !self.autostart_background_expanded;
+            }
             Message::SetPerformanceViewMode(mode) => self.performance_view_mode = mode,
             Message::MountDisk(disk_name) => {
                 self.mount_disk(&disk_name);
@@ -629,7 +746,8 @@ impl cosmic::Application for AppModel {
         let space_s = theme::spacing().space_s;
         let content: Element<_> = match self.nav.active_data::<Page>().unwrap() {
             Page::Page1 => self.apps_view(space_s),
-            Page::Page2 => self.performance_view(space_s),
+            Page::Page2 => self.autostart_view(space_s),
+            Page::Page3 => self.performance_view(space_s),
         };
 
         widget::container(content)
@@ -856,7 +974,7 @@ impl AppModel {
             .and_then(Self::parse_temperature_celsius_from_value);
 
         Some(GpuRuntimeInfo {
-            name: columns[0].clone(),
+            name: Self::short_gpu_name(&columns[0], "NVIDIA"),
             provider: "NVIDIA".to_string(),
             driver: columns[7].clone(),
             utilization_percent,
@@ -889,7 +1007,7 @@ impl AppModel {
         let (current_clock_mhz, max_clock_mhz) = Self::gpu_clock_from_device(&device_path);
 
         Some(GpuRuntimeInfo {
-            name,
+            name: Self::short_gpu_name(&name, &provider),
             provider,
             driver,
             utilization_percent,
@@ -986,6 +1104,49 @@ impl AppModel {
         }
 
         Some(format!("{provider} GPU"))
+    }
+
+    fn short_gpu_name(raw_name: &str, provider: &str) -> String {
+        let mut name = raw_name.trim().to_string();
+        if name.is_empty() {
+            return format!("{provider} GPU");
+        }
+
+        // Strip common PCI noise first, then prefer the model in the final bracket pair.
+        name = name
+            .split(" (rev ")
+            .next()
+            .unwrap_or(name.as_str())
+            .trim()
+            .to_string();
+        if let (Some(start), Some(end)) = (name.rfind('['), name.rfind(']')) {
+            if end > start + 1 {
+                let bracketed = name[start + 1..end].trim();
+                if !bracketed.is_empty() {
+                    name = bracketed.to_string();
+                }
+            }
+        }
+
+        name = name
+            .replace("Advanced Micro Devices, Inc. [AMD/ATI]", "")
+            .replace("NVIDIA Corporation", "NVIDIA")
+            .replace("Intel Corporation", "Intel")
+            .replace("(TM)", "")
+            .replace("  ", " ")
+            .trim()
+            .to_string();
+
+        if provider.eq_ignore_ascii_case("AMD") {
+            if let Some(rest) = name.strip_prefix("Radeon ") {
+                return format!("AMD {rest}").trim().to_string();
+            }
+            if !name.to_ascii_lowercase().starts_with("amd ") {
+                return format!("AMD {name}").trim().to_string();
+            }
+        }
+
+        name
     }
 
     fn gpu_busy_percent_from_device(device_path: &Path) -> Option<f32> {
@@ -1672,6 +1833,7 @@ impl AppModel {
 pub enum Page {
     Page1,
     Page2,
+    Page3,
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]

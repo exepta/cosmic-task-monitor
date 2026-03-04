@@ -20,6 +20,7 @@ impl AppModel {
 
     pub(super) fn refresh_processes(&mut self) {
         self.desktop_apps_by_exec = Self::load_desktop_app_map();
+        self.refresh_autostart_state();
         self.disks.refresh(true);
         let mut read_by_disk: HashMap<String, u64> = HashMap::new();
         let mut write_by_disk: HashMap<String, u64> = HashMap::new();
@@ -238,6 +239,7 @@ impl AppModel {
         struct Aggregate {
             name: String,
             icon_handle: Option<icon::Handle>,
+            is_background: bool,
             pid: u32,
             cpu_percent: f32,
             rss_bytes: u64,
@@ -259,32 +261,36 @@ impl AppModel {
                 continue;
             }
 
-            let matched_app = Self::desktop_app_for_process(process, &self.desktop_apps_by_exec)
-                .map(|app_meta| {
-                    (
-                        app_meta.app_id.clone(),
-                        app_meta.name.clone(),
-                        app_meta.icon_handle.clone(),
-                    )
-                })
-                .or_else(|| {
-                    Self::steam_app_id_for_process(process, processes).map(|steam_app_id| {
-                        let steam_meta = steam_apps_by_id
-                            .entry(steam_app_id.clone())
-                            .or_insert_with(|| {
-                                Self::load_steam_app_meta(&steam_app_id, steam_icon_handle.clone())
-                            });
+            let (app_id, app_name, app_is_background, app_icon_handle) = if let Some(app_meta) =
+                Self::desktop_app_for_process(process, &self.desktop_apps_by_exec)
+            {
+                (
+                    app_meta.app_id.clone(),
+                    app_meta.name.clone(),
+                    false,
+                    app_meta.icon_handle.clone(),
+                )
+            } else if let Some(steam_app_id) = Self::steam_app_id_for_process(process, processes) {
+                let steam_meta =
+                    steam_apps_by_id
+                        .entry(steam_app_id.clone())
+                        .or_insert_with(|| {
+                            Self::load_steam_app_meta(&steam_app_id, steam_icon_handle.clone())
+                        });
 
-                        (
-                            format!("steam-app-{steam_app_id}"),
-                            steam_meta.name.clone(),
-                            steam_meta.icon_handle.clone(),
-                        )
-                    })
-                });
-
-            let Some((app_id, app_name, app_icon_handle)) = matched_app else {
-                continue;
+                (
+                    format!("steam-app-{steam_app_id}"),
+                    steam_meta.name.clone(),
+                    true,
+                    steam_meta.icon_handle.clone(),
+                )
+            } else {
+                (
+                    Self::fallback_app_id_for_process(process),
+                    Self::fallback_app_name_for_process(process),
+                    true,
+                    None,
+                )
             };
             if Self::is_excluded_app_id(&app_id) {
                 continue;
@@ -293,12 +299,14 @@ impl AppModel {
             let entry = groups.entry(app_id).or_insert_with(|| Aggregate {
                 name: app_name,
                 icon_handle: app_icon_handle,
+                is_background: app_is_background,
                 pid: process.pid().as_u32(),
                 rss_bytes: process.memory(),
                 ..Aggregate::default()
             });
 
             entry.cpu_percent += (process.cpu_usage() / cpu_core_count).clamp(0.0, 100.0);
+            entry.is_background |= app_is_background;
             entry.pid = entry.pid.min(process.pid().as_u32());
             entry.rss_bytes = entry.rss_bytes.max(process.memory());
             entry.threads += process.tasks().map_or(1, |tasks| tasks.len() as u32);
@@ -310,6 +318,7 @@ impl AppModel {
                 app_id,
                 display_name: entry.name.clone(),
                 name: entry.name,
+                is_background: entry.is_background,
                 pid: entry.pid,
                 icon_handle: entry.icon_handle,
                 cpu_percent: entry.cpu_percent.clamp(0.0, 100.0),
@@ -807,8 +816,24 @@ impl AppModel {
             return Some(app_meta.app_id.clone());
         }
 
-        Self::steam_app_id_for_process(process, processes)
-            .map(|steam_app_id| format!("steam-app-{steam_app_id}"))
+        if let Some(steam_app_id) = Self::steam_app_id_for_process(process, processes) {
+            return Some(format!("steam-app-{steam_app_id}"));
+        }
+
+        Some(Self::fallback_app_id_for_process(process))
+    }
+
+    fn fallback_app_name_for_process(process: &sysinfo::Process) -> String {
+        process.name().to_string_lossy().trim().to_string()
+    }
+
+    fn fallback_app_id_for_process(process: &sysinfo::Process) -> String {
+        let name = Self::fallback_app_name_for_process(process);
+        if let Some(normalized) = Self::normalize_exec_key(&name) {
+            normalized
+        } else {
+            format!("pid-{}", process.pid().as_u32())
+        }
     }
 
     fn process_candidate_keys(process: &sysinfo::Process) -> Vec<String> {
