@@ -16,6 +16,34 @@ struct ParsedDesktopEntry {
 }
 
 impl AppModel {
+    fn set_autostart_feedback(
+        &mut self,
+        level: AutostartFeedbackLevel,
+        message: String,
+        expires_at: Option<Instant>,
+    ) {
+        self.autostart_feedback = Some(AutostartFeedback {
+            level,
+            message,
+            expires_at,
+        });
+    }
+
+    pub(super) fn dismiss_autostart_feedback(&mut self) {
+        self.autostart_feedback = None;
+    }
+
+    pub(super) fn clear_expired_autostart_feedback(&mut self) {
+        let should_clear = self
+            .autostart_feedback
+            .as_ref()
+            .and_then(|feedback| feedback.expires_at)
+            .is_some_and(|expires_at| Instant::now() >= expires_at);
+        if should_clear {
+            self.autostart_feedback = None;
+        }
+    }
+
     pub(super) fn refresh_autostart_state(&mut self) {
         self.autostart_entries = Self::load_autostart_entries(&self.desktop_apps_by_exec);
         self.autostart_add_options =
@@ -36,18 +64,196 @@ impl AppModel {
         }
     }
 
+    pub(super) fn open_selected_autostart_path(&mut self) {
+        let Some(selected) = self.selected_autostart_entry.as_ref() else {
+            return;
+        };
+        let path = PathBuf::from(&selected.autostart_path);
+        let open_path = path
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or(path);
+        if let Err(err) = open::that_detached(open_path) {
+            eprintln!("failed to open autostart path: {err}");
+        }
+    }
+
+    pub(super) fn edit_selected_autostart_desktop(&mut self) {
+        let Some(selected) = self.selected_autostart_entry.as_ref() else {
+            return;
+        };
+        if let Err(err) = open::that_detached(PathBuf::from(&selected.autostart_path)) {
+            eprintln!("failed to open autostart desktop file: {err}");
+        }
+    }
+
+    pub(super) fn request_remove_selected_autostart(&mut self) {
+        if self.selected_autostart_entry.is_none() {
+            return;
+        }
+        self.autostart_remove_modal_open = true;
+        self.core.window.show_context = false;
+    }
+
+    pub(super) fn cancel_remove_selected_autostart(&mut self) {
+        self.autostart_remove_modal_open = false;
+    }
+
+    pub(super) fn confirm_remove_selected_autostart(&mut self) {
+        let Some(selected) = self.selected_autostart_entry.as_ref().cloned() else {
+            self.autostart_remove_modal_open = false;
+            return;
+        };
+
+        match Self::remove_autostart_entry(&selected.autostart_path, selected.is_background) {
+            Ok(()) => {
+                self.refresh_autostart_state();
+                self.set_autostart_feedback(
+                    AutostartFeedbackLevel::Success,
+                    fl!("autostart-feedback-remove-success", name = selected.name),
+                    Some(Instant::now() + AUTOSTART_FEEDBACK_TIMEOUT),
+                );
+                self.autostart_remove_modal_open = false;
+                self.core.window.show_context = false;
+                self.selected_autostart_entry = None;
+            }
+            Err(err) => {
+                self.set_autostart_feedback(
+                    AutostartFeedbackLevel::Error,
+                    fl!(
+                        "autostart-feedback-remove-failed",
+                        name = selected.name,
+                        error = err.to_string()
+                    ),
+                    None,
+                );
+                self.autostart_remove_modal_open = false;
+            }
+        }
+    }
+
+    pub(super) fn create_custom_autostart_desktop(&mut self) {
+        match Self::write_custom_autostart_entry_template() {
+            Ok(path) => {
+                if let Err(err) = open::that_detached(path.clone()) {
+                    self.set_autostart_feedback(
+                        AutostartFeedbackLevel::Error,
+                        fl!("autostart-feedback-custom-failed", error = err.to_string()),
+                        None,
+                    );
+                    return;
+                }
+
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+                self.refresh_autostart_state();
+                self.autostart_modal_open = false;
+                self.set_autostart_feedback(
+                    AutostartFeedbackLevel::Success,
+                    fl!("autostart-feedback-custom-created", file = file_name),
+                    Some(Instant::now() + AUTOSTART_FEEDBACK_TIMEOUT),
+                );
+                self.autostart_desktop_expanded = true;
+                self.autostart_background_expanded = true;
+            }
+            Err(err) => {
+                self.set_autostart_feedback(
+                    AutostartFeedbackLevel::Error,
+                    fl!("autostart-feedback-custom-failed", error = err.to_string()),
+                    None,
+                );
+            }
+        }
+    }
+
+    pub(super) fn import_autostart_desktop_from_file(&mut self) {
+        let picked = match Self::pick_desktop_file_path() {
+            Ok(path) => path,
+            Err(err) => {
+                self.set_autostart_feedback(
+                    AutostartFeedbackLevel::Error,
+                    fl!("autostart-feedback-import-failed", error = err.to_string()),
+                    None,
+                );
+                return;
+            }
+        };
+
+        let Some(source_path) = picked else {
+            return;
+        };
+
+        match Self::import_desktop_file_to_autostart(&source_path) {
+            Ok(target) => {
+                let file_name = target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| target.to_string_lossy().to_string());
+                self.refresh_autostart_state();
+                self.autostart_modal_open = false;
+                self.set_autostart_feedback(
+                    AutostartFeedbackLevel::Success,
+                    fl!("autostart-feedback-import-success", file = file_name),
+                    Some(Instant::now() + AUTOSTART_FEEDBACK_TIMEOUT),
+                );
+                self.autostart_desktop_expanded = true;
+                self.autostart_background_expanded = true;
+            }
+            Err(err) => {
+                self.set_autostart_feedback(
+                    AutostartFeedbackLevel::Error,
+                    fl!("autostart-feedback-import-failed", error = err.to_string()),
+                    None,
+                );
+            }
+        }
+    }
+
     pub(super) fn confirm_autostart_modal(&mut self) {
         let Some(index) = self.autostart_modal_selected_option else {
+            self.set_autostart_feedback(
+                AutostartFeedbackLevel::Error,
+                fl!("autostart-feedback-no-selection"),
+                None,
+            );
             return;
         };
         let Some(option) = self.autostart_add_options.get(index).cloned() else {
+            self.set_autostart_feedback(
+                AutostartFeedbackLevel::Error,
+                fl!("autostart-feedback-no-selection"),
+                None,
+            );
             return;
         };
         if let Err(err) = Self::write_autostart_entry(&option) {
             eprintln!("failed to add autostart entry {}: {err}", option.name);
+            self.set_autostart_feedback(
+                AutostartFeedbackLevel::Error,
+                fl!(
+                    "autostart-feedback-create-failed",
+                    name = option.name,
+                    error = err.to_string()
+                ),
+                None,
+            );
+            return;
         }
+
         self.refresh_autostart_state();
+        self.set_autostart_feedback(
+            AutostartFeedbackLevel::Success,
+            fl!("autostart-feedback-create-success", name = option.name),
+            Some(Instant::now() + AUTOSTART_FEEDBACK_TIMEOUT),
+        );
         self.autostart_modal_open = false;
+        self.autostart_desktop_expanded = true;
+        self.autostart_background_expanded = true;
     }
 
     pub(super) fn autostart_add_dialog(&self) -> Option<Element<'_, Message>> {
@@ -106,6 +312,45 @@ impl AppModel {
                 .width(Length::Fill)
                 .into()
         };
+        let custom_controls: Element<'_, Message> = widget::container(
+            widget::column::with_capacity(4)
+                .push(widget::text(fl!("autostart-custom-description")).size(13))
+                .push(
+                    widget::button::standard(fl!("autostart-custom-button"))
+                        .on_press(Message::CreateCustomAutostartDesktop),
+                )
+                .push(widget::text(fl!("autostart-import-description")).size(13))
+                .push(
+                    widget::button::standard(fl!("autostart-import-button"))
+                        .on_press(Message::ImportAutostartDesktopFromFile),
+                )
+                .spacing(8)
+                .width(Length::Fill),
+        )
+        .padding([0, 0, 8, 0])
+        .width(Length::Fill)
+        .into();
+
+        let control_content: Element<'_, Message> = if let Some(feedback) = self
+            .autostart_feedback
+            .as_ref()
+            .filter(|feedback| feedback.level == AutostartFeedbackLevel::Error)
+        {
+            widget::column::with_capacity(3)
+                .push(custom_controls)
+                .push(widget::text(feedback.message.clone()).size(14))
+                .push(options_content)
+                .spacing(8)
+                .width(Length::Fill)
+                .into()
+        } else {
+            widget::column::with_capacity(2)
+                .push(custom_controls)
+                .push(options_content)
+                .spacing(8)
+                .width(Length::Fill)
+                .into()
+        };
 
         let mut create_button = widget::button::standard(fl!("autostart-modal-create"));
         if !self.autostart_add_options.is_empty() && self.autostart_modal_selected_option.is_some()
@@ -117,12 +362,52 @@ impl AppModel {
             widget::dialog()
                 .title(fl!("autostart-modal-title"))
                 .body(fl!("autostart-modal-description"))
-                .control(options_content)
+                .control(control_content)
                 .secondary_action(
                     widget::button::standard(fl!("autostart-modal-cancel"))
                         .on_press(Message::CloseAutostartModal),
                 )
                 .primary_action(create_button)
+                .max_width(720.0)
+                .into(),
+        )
+    }
+
+    pub(super) fn autostart_remove_dialog(&self) -> Option<Element<'_, Message>> {
+        if !self.autostart_remove_modal_open {
+            return None;
+        }
+        let Some(selected) = self.selected_autostart_entry.as_ref() else {
+            return None;
+        };
+
+        let description = if selected.is_background {
+            fl!(
+                "autostart-remove-modal-description-background",
+                name = selected.name.clone()
+            )
+        } else {
+            fl!(
+                "autostart-remove-modal-description",
+                name = selected.name.clone()
+            )
+        };
+
+        Some(
+            widget::dialog()
+                .title(fl!("autostart-remove-modal-title"))
+                .body(description)
+                .control(widget::container(
+                    widget::text(selected.autostart_path.clone()).size(12),
+                ))
+                .secondary_action(
+                    widget::button::standard(fl!("autostart-modal-cancel"))
+                        .on_press(Message::CancelRemoveSelectedAutostart),
+                )
+                .primary_action(
+                    widget::button::destructive(fl!("autostart-action-remove"))
+                        .on_press(Message::ConfirmRemoveSelectedAutostart),
+                )
                 .max_width(720.0)
                 .into(),
         )
@@ -161,10 +446,51 @@ impl AppModel {
             )
             .align_y(Alignment::Center)
             .into();
+        let feedback_banner = self
+            .autostart_feedback
+            .as_ref()
+            .filter(|feedback| feedback.level == AutostartFeedbackLevel::Success)
+            .map(|feedback| {
+                let green = Color::from_rgb(39.0 / 255.0, 155.0 / 255.0, 77.0 / 255.0);
+                let dismiss_button = widget::button::custom(widget::text("x").size(16))
+                    .on_press(Message::DismissAutostartFeedback)
+                    .padding([0, 8])
+                    .class(theme::Button::Text);
 
-        let content = widget::column::with_capacity(4)
+                widget::container(
+                    widget::row::with_capacity(2)
+                        .push(
+                            widget::text(feedback.message.clone())
+                                .size(14)
+                                .width(Length::Fill),
+                        )
+                        .push(dismiss_button)
+                        .align_y(Alignment::Center)
+                        .spacing(8)
+                        .width(Length::Fill),
+                )
+                .padding([10, 12])
+                .class(theme::Container::custom(move |_theme| {
+                    widget::container::Style {
+                        background: Some(Background::Color(Color { a: 0.14, ..green })),
+                        border: Border {
+                            color: green,
+                            width: 1.0,
+                            radius: 10.0.into(),
+                        },
+                        ..Default::default()
+                    }
+                }))
+                .width(Length::Fill)
+            });
+
+        let mut content = widget::column::with_capacity(5)
             .push(header)
-            .push(add_controls)
+            .push(add_controls);
+        if let Some(feedback_banner) = feedback_banner {
+            content = content.push(feedback_banner);
+        }
+        content = content
             .push(self.autostart_section_table(
                 fl!("autostart-desktop-apps"),
                 self.autostart_desktop_expanded,
@@ -280,12 +606,18 @@ impl AppModel {
                 .fold(
                     widget::column::with_capacity(entry_count),
                     |column, entry| {
+                        let menu_name = entry.name.clone();
+                        let menu_autostart_path = entry.autostart_path.clone();
+                        let menu_is_background = entry.is_background;
+                        let display_name = entry.name.clone();
+                        let display_path = entry.autostart_path.clone();
+                        let display_exec = entry.exec.clone();
                         let name_cell: Element<'_, Message> =
                             if let Some(icon_handle) = entry.icon_handle {
                                 widget::row::with_capacity(2)
                                     .push(icon::icon(icon_handle).size(18))
                                     .push(
-                                        widget::text(entry.name)
+                                        widget::text(display_name.clone())
                                             .width(Length::Fill)
                                             .wrapping(cosmic::iced::widget::text::Wrapping::None)
                                             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -297,7 +629,7 @@ impl AppModel {
                                     .spacing(space_s)
                                     .into()
                             } else {
-                                widget::text(entry.name)
+                                widget::text(display_name.clone())
                                     .width(Length::Fill)
                                     .wrapping(cosmic::iced::widget::text::Wrapping::None)
                                     .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -307,41 +639,51 @@ impl AppModel {
                             };
 
                         column.push(
-                            widget::row::with_capacity(3)
-                                .push(
-                                    widget::container(name_cell)
+                            widget::button::custom(
+                                widget::row::with_capacity(3)
+                                    .push(
+                                        widget::container(name_cell)
+                                            .padding(10)
+                                            .class(theme::Container::custom(table_cell_style))
+                                            .width(Length::FillPortion(4)),
+                                    )
+                                    .push(
+                                        widget::container(
+                                            widget::text(display_path.clone())
+                                                .width(Length::Fill)
+                                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                                                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                                                    cosmic::iced_core::text::EllipsizeHeightLimit::Lines(1),
+                                                )),
+                                        )
                                         .padding(10)
                                         .class(theme::Container::custom(table_cell_style))
-                                        .width(Length::FillPortion(4)),
-                                )
-                                .push(
-                                    widget::container(
-                                        widget::text(entry.autostart_path)
-                                            .width(Length::Fill)
-                                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                                            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                                                cosmic::iced_core::text::EllipsizeHeightLimit::Lines(1),
-                                            )),
+                                        .width(Length::FillPortion(3)),
                                     )
-                                    .padding(10)
-                                    .class(theme::Container::custom(table_cell_style))
-                                    .width(Length::FillPortion(3)),
-                                )
-                                .push(
-                                    widget::container(
-                                        widget::text(entry.exec)
-                                            .width(Length::Fill)
-                                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                                            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                                                cosmic::iced_core::text::EllipsizeHeightLimit::Lines(1),
-                                            )),
+                                    .push(
+                                        widget::container(
+                                            widget::text(display_exec)
+                                                .width(Length::Fill)
+                                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                                                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                                                    cosmic::iced_core::text::EllipsizeHeightLimit::Lines(1),
+                                                )),
+                                        )
+                                        .padding(10)
+                                        .class(theme::Container::custom(table_cell_style))
+                                        .width(Length::FillPortion(5)),
                                     )
-                                    .padding(10)
-                                    .class(theme::Container::custom(table_cell_style))
-                                    .width(Length::FillPortion(5)),
-                                )
-                                .spacing(0)
-                                .width(Length::Fill),
+                                    .spacing(0)
+                                    .width(Length::Fill),
+                            )
+                            .on_press(Message::OpenAutostartEntryMenu {
+                                name: menu_name,
+                                autostart_path: menu_autostart_path,
+                                is_background: menu_is_background,
+                            })
+                            .padding(0)
+                            .class(table_row_button_style())
+                            .width(Length::Fill),
                         )
                     },
                 )
@@ -369,6 +711,12 @@ impl AppModel {
         let tiles: Vec<Element<'_, Message>> = owned_entries
             .into_iter()
             .map(|entry| {
+                let menu_name = entry.name.clone();
+                let menu_autostart_path = entry.autostart_path.clone();
+                let menu_is_background = entry.is_background;
+                let display_name = entry.name.clone();
+                let display_path = entry.autostart_path.clone();
+                let display_exec = entry.exec.clone();
                 let icon_content: Element<'_, Message> =
                     if let Some(icon_handle) = entry.icon_handle {
                         icon::icon(icon_handle).size(56).into()
@@ -380,7 +728,7 @@ impl AppModel {
 
                 let details = widget::column::with_capacity(3)
                     .push(
-                        widget::text(entry.name)
+                        widget::text(display_name)
                             .size(20)
                             .width(Length::Fill)
                             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -389,7 +737,7 @@ impl AppModel {
                             )),
                     )
                     .push(
-                        widget::text(entry.autostart_path)
+                        widget::text(display_path)
                             .size(12)
                             .width(Length::Fill)
                             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -398,7 +746,7 @@ impl AppModel {
                             )),
                     )
                     .push(
-                        widget::text(entry.exec)
+                        widget::text(display_exec)
                             .size(12)
                             .width(Length::Fill)
                             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -410,16 +758,26 @@ impl AppModel {
                     .width(Length::Fill);
 
                 widget::container(
-                    widget::container(
-                        widget::row::with_capacity(2)
-                            .push(widget::container(icon_content).center_x(Length::Fixed(56.0)))
-                            .push(details)
-                            .spacing(25)
-                            .align_y(Alignment::Center)
-                            .width(Length::Fill),
+                    widget::button::custom(
+                        widget::container(
+                            widget::row::with_capacity(2)
+                                .push(widget::container(icon_content).center_x(Length::Fixed(56.0)))
+                                .push(details)
+                                .spacing(25)
+                                .align_y(Alignment::Center)
+                                .width(Length::Fill),
+                        )
+                        .padding(12)
+                        .class(theme::Container::custom(table_cell_style))
+                        .width(Length::Fill),
                     )
-                    .padding(12)
-                    .class(theme::Container::custom(table_cell_style))
+                    .on_press(Message::OpenAutostartEntryMenu {
+                        name: menu_name,
+                        autostart_path: menu_autostart_path,
+                        is_background: menu_is_background,
+                    })
+                    .padding(0)
+                    .class(table_row_button_style())
                     .width(Length::Fill),
                 )
                 .width(Length::Fill)
@@ -607,12 +965,13 @@ impl AppModel {
         let autostart_dir = Self::user_autostart_dir();
         fs::create_dir_all(&autostart_dir)?;
 
-        let file_name = option
+        let file_name_raw = option
             .desktop_entry_id
             .as_deref()
             .filter(|id| !id.trim().is_empty())
             .map(ToString::to_string)
-            .unwrap_or_else(|| format!("{}.desktop", option.app_id));
+            .unwrap_or_else(|| option.app_id.clone());
+        let file_name = Self::normalize_desktop_file_name(&file_name_raw);
         let target = autostart_dir.join(file_name);
 
         let parsed_source = option
@@ -660,6 +1019,200 @@ impl AppModel {
         desktop_file.push_str("Hidden=false\n");
 
         fs::write(target, desktop_file)
+    }
+
+    fn write_custom_autostart_entry_template() -> std::io::Result<PathBuf> {
+        let autostart_dir = Self::user_autostart_dir();
+        fs::create_dir_all(&autostart_dir)?;
+
+        let target = Self::next_available_autostart_target_path(
+            &autostart_dir,
+            &Self::normalize_desktop_file_name("custom-autostart"),
+        );
+
+        let mut desktop_file = String::new();
+        desktop_file.push_str("[Desktop Entry]\n");
+        desktop_file.push_str("Type=Application\n");
+        desktop_file.push_str("Version=1.0\n");
+        desktop_file.push_str("Name=Custom Autostart\n");
+        desktop_file
+            .push_str("Comment=Edit Name and Exec to configure this custom autostart entry\n");
+        desktop_file.push_str("Icon=application-x-executable\n");
+        desktop_file.push_str("Exec=/usr/bin/true\n");
+        desktop_file.push_str("X-GNOME-Autostart-enabled=true\n");
+        desktop_file.push_str("NoDisplay=false\n");
+        desktop_file.push_str("Hidden=false\n");
+
+        fs::write(&target, desktop_file)?;
+        Ok(target)
+    }
+
+    fn pick_desktop_file_path() -> std::io::Result<Option<PathBuf>> {
+        let zenity_result = Self::pick_desktop_file_with_command(
+            "zenity",
+            &[
+                "--file-selection",
+                "--title=Desktop-Datei auswählen",
+                "--file-filter=Desktop files | *.desktop",
+            ],
+        );
+        match zenity_result {
+            Ok(path) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+
+        let kdialog_result = Self::pick_desktop_file_with_command(
+            "kdialog",
+            &[
+                "--title",
+                "Desktop-Datei auswählen",
+                "--getopenfilename",
+                ".",
+                "*.desktop|Desktop files (*.desktop)",
+            ],
+        );
+        match kdialog_result {
+            Ok(path) => Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "kein Dateiauswahldialog gefunden (zenity/kdialog)",
+            )),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn pick_desktop_file_with_command(
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<Option<PathBuf>> {
+        let output = Command::new(program)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()?;
+
+        if output.status.success() {
+            let picked = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| PathBuf::from(line.trim()));
+            return Ok(picked);
+        }
+
+        // User cancelled dialogs usually exit with code 1.
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("{program} dateiauswahl fehlgeschlagen"),
+        ))
+    }
+
+    fn import_desktop_file_to_autostart(source: &Path) -> std::io::Result<PathBuf> {
+        if !source
+            .extension()
+            .is_some_and(|ext| ext == OsStr::new("desktop"))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ausgewählte Datei ist keine .desktop-Datei",
+            ));
+        }
+
+        let autostart_dir = Self::user_autostart_dir();
+        fs::create_dir_all(&autostart_dir)?;
+
+        let file_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(Self::normalize_desktop_file_name)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Dateiname der .desktop-Datei ist ungültig",
+                )
+            })?;
+        let target = Self::next_available_autostart_target_path(&autostart_dir, &file_name);
+        fs::copy(source, &target)?;
+        Ok(target)
+    }
+
+    fn normalize_desktop_file_name(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.to_ascii_lowercase().ends_with(".desktop") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}.desktop")
+        }
+    }
+
+    fn next_available_autostart_target_path(dir: &Path, file_name: &str) -> PathBuf {
+        let normalized = Self::normalize_desktop_file_name(file_name);
+        let mut candidate = dir.join(&normalized);
+        if !candidate.exists() {
+            return candidate;
+        }
+
+        let stem = Path::new(&normalized)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("custom-autostart")
+            .to_string();
+        let ext = Path::new(&normalized)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("desktop");
+
+        let mut counter = 1_u32;
+        loop {
+            candidate = dir.join(format!("{stem}-{counter}.{ext}"));
+            if !candidate.exists() {
+                return candidate;
+            }
+            counter += 1;
+        }
+    }
+
+    fn remove_autostart_entry(path: &str, force_pkexec: bool) -> std::io::Result<()> {
+        let target = PathBuf::from(path);
+        if force_pkexec {
+            return Self::remove_autostart_entry_with_pkexec(&target);
+        }
+
+        match fs::remove_file(&target) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                Self::remove_autostart_entry_with_pkexec(&target)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn remove_autostart_entry_with_pkexec(path: &Path) -> std::io::Result<()> {
+        let status = Command::new("pkexec")
+            .args(["rm", "-f"])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("pkexec konnte nicht gestartet werden: {err}"),
+                )
+            })?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Entfernen mit pkexec ist fehlgeschlagen",
+            ))
+        }
     }
 
     fn user_autostart_dir() -> PathBuf {

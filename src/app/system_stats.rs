@@ -112,6 +112,7 @@ impl AppModel {
             };
             let mode = PerformanceViewMode::Disk(disk.name.clone());
             let is_selected = self.performance_view_mode == mode;
+            let is_usb = disk.kind_label.to_ascii_lowercase().contains("usb");
 
             sidebar = sidebar.push(self.disk_selector_card(
                 format!("Disk {}", disk.name),
@@ -122,6 +123,7 @@ impl AppModel {
                     Self::format_rss(disk.total_bytes)
                 ),
                 disk.is_mounted,
+                is_usb,
                 is_selected,
                 Some(Message::SetPerformanceViewMode(mode)),
             ));
@@ -613,22 +615,36 @@ impl AppModel {
         disk_kind: String,
         usage_text: String,
         is_mounted: bool,
+        is_usb: bool,
         is_selected: bool,
         on_press: Option<Message>,
     ) -> widget::Button<'_, Message> {
-        let mut title_row = widget::row::with_capacity(3)
+        let mut title_row = widget::row::with_capacity(5)
             .push(widget::text(title).size(18))
             .push(widget::horizontal_space())
             .width(Length::Fill)
             .align_y(Alignment::Center);
 
-        if is_mounted {
-            title_row =
-                title_row.push(icon::from_name("emblem-ok-symbolic").icon().size(14).class(
-                    theme::Svg::custom(|_| cosmic::iced_widget::svg::Style {
+        if is_usb {
+            title_row = title_row.push(
+                icon::from_name("drive-harddisk-usb-symbolic")
+                    .icon()
+                    .size(14)
+                    .class(theme::Svg::custom(|_| cosmic::iced_widget::svg::Style {
                         color: Some(DISK_ACCENT),
-                    }),
-                ));
+                    })),
+            );
+        }
+
+        if is_mounted {
+            title_row = title_row.push(
+                icon::from_name("folder-open-symbolic")
+                    .icon()
+                    .size(14)
+                    .class(theme::Svg::custom(|_| cosmic::iced_widget::svg::Style {
+                        color: Some(DISK_ACCENT),
+                    })),
+            );
         }
 
         let mut button = widget::button::custom(
@@ -1385,6 +1401,11 @@ impl AppModel {
             .temperature_celsius
             .map(Self::format_temp_c)
             .unwrap_or_else(|| fl!("gpu-not-available"));
+        let mesa_version_text = self
+            .gpu_runtime_info
+            .mesa_version
+            .clone()
+            .unwrap_or_else(|| fl!("gpu-not-available"));
 
         let stat_block = |label: String, value: String, accent: bool| {
             let mut value_text = widget::text(value).size(26);
@@ -1470,7 +1491,7 @@ impl AppModel {
                 .width(Length::Shrink)
         };
 
-        let stats_col_2 = widget::column::with_capacity(6)
+        let stats_col_2 = widget::column::with_capacity(9)
             .push(right_line(
                 fl!("gpu-name"),
                 self.gpu_runtime_info.name.clone(),
@@ -1483,6 +1504,7 @@ impl AppModel {
                 fl!("gpu-driver"),
                 self.gpu_runtime_info.driver.clone(),
             ))
+            .push(right_line(fl!("gpu-mesa"), mesa_version_text))
             .push(right_line(fl!("gpu-vram"), vram_combined))
             .push(right_line(
                 fl!("gpu-current-utilization"),

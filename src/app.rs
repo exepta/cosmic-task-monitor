@@ -20,6 +20,7 @@ use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 
@@ -29,6 +30,7 @@ const APP_ICON: &[u8] = include_bytes!(
 );
 const PROCESS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const PERFORMANCE_HISTORY_POINTS: usize = 60;
+const AUTOSTART_FEEDBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const CPU_ACCENT: Color = Color::from_rgb(155.0 / 255.0, 88.0 / 255.0, 180.0 / 255.0);
 const RAM_ACCENT: Color = Color::from_rgb(126.0 / 255.0, 189.0 / 255.0, 195.0 / 255.0);
 const GPU_ACCENT: Color = Color::from_rgb(231.0 / 255.0, 141.0 / 255.0, 56.0 / 255.0);
@@ -163,6 +165,19 @@ struct AutostartAddOption {
     desktop_entry_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AutostartFeedbackLevel {
+    Success,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct AutostartFeedback {
+    level: AutostartFeedbackLevel,
+    message: String,
+    expires_at: Option<Instant>,
+}
+
 #[derive(Clone)]
 struct DesktopAppMeta {
     app_id: String,
@@ -188,6 +203,13 @@ struct SelectedProcess {
 }
 
 #[derive(Debug, Clone)]
+struct SelectedAutostartEntry {
+    name: String,
+    autostart_path: String,
+    is_background: bool,
+}
+
+#[derive(Debug, Clone)]
 struct CpuStaticInfo {
     sockets: String,
     virtualization: String,
@@ -201,6 +223,7 @@ struct GpuRuntimeInfo {
     name: String,
     provider: String,
     driver: String,
+    mesa_version: Option<String>,
     utilization_percent: Option<f32>,
     temperature_celsius: Option<f32>,
     vram_used_bytes: Option<u64>,
@@ -274,6 +297,7 @@ impl Default for GpuRuntimeInfo {
             name: "Unknown GPU".to_string(),
             provider: "Unknown".to_string(),
             driver: "Unknown".to_string(),
+            mesa_version: None,
             utilization_percent: None,
             temperature_celsius: None,
             vram_used_bytes: None,
@@ -343,13 +367,16 @@ pub struct AppModel {
     steam_apps_by_id: HashMap<String, SteamAppMeta>,
     process_entries: Vec<ProcessEntry>,
     selected_process: Option<SelectedProcess>,
+    selected_autostart_entry: Option<SelectedAutostartEntry>,
     apps_view_mode: AppsViewMode,
     apps_desktop_expanded: bool,
     apps_background_expanded: bool,
     autostart_entries: Vec<AutostartEntry>,
     autostart_add_options: Vec<AutostartAddOption>,
     autostart_modal_open: bool,
+    autostart_remove_modal_open: bool,
     autostart_modal_selected_option: Option<usize>,
+    autostart_feedback: Option<AutostartFeedback>,
     autostart_desktop_expanded: bool,
     autostart_background_expanded: bool,
     performance_view_mode: PerformanceViewMode,
@@ -383,6 +410,20 @@ pub enum Message {
     CloseAutostartModal,
     SelectAutostartModalOption(usize),
     ConfirmAutostartModal,
+    CreateCustomAutostartDesktop,
+    ImportAutostartDesktopFromFile,
+    DismissAutostartFeedback,
+    OpenAutostartEntryMenu {
+        name: String,
+        autostart_path: String,
+        is_background: bool,
+    },
+    CloseAutostartEntryMenu,
+    OpenSelectedAutostartPath,
+    EditSelectedAutostartDesktop,
+    RequestRemoveSelectedAutostart,
+    CancelRemoveSelectedAutostart,
+    ConfirmRemoveSelectedAutostart,
     ToggleAutostartDesktopSection,
     ToggleAutostartBackgroundSection,
     SetPerformanceViewMode(PerformanceViewMode),
@@ -464,13 +505,16 @@ impl cosmic::Application for AppModel {
             steam_apps_by_id: HashMap::new(),
             process_entries: Vec::new(),
             selected_process: None,
+            selected_autostart_entry: None,
             apps_view_mode: AppsViewMode::List,
             apps_desktop_expanded: true,
             apps_background_expanded: false,
             autostart_entries: Vec::new(),
             autostart_add_options: Vec::new(),
             autostart_modal_open: false,
+            autostart_remove_modal_open: false,
             autostart_modal_selected_option: None,
+            autostart_feedback: None,
             autostart_desktop_expanded: true,
             autostart_background_expanded: false,
             performance_view_mode: PerformanceViewMode::Cpu,
@@ -570,11 +614,53 @@ impl cosmic::Application for AppModel {
                 context_drawer::context_drawer(padded_content, Message::CloseProcessMenu)
                     .title(title)
             }
+            ContextPage::AutostartActions => {
+                let title = self
+                    .selected_autostart_entry
+                    .as_ref()
+                    .map(|entry| entry.name.clone())
+                    .unwrap_or_else(|| fl!("autostart-actions-title"));
+
+                let button_height = Length::Fixed(38.0);
+                let content: Element<'_, Message> =
+                    if let Some(selected) = self.selected_autostart_entry.as_ref() {
+                        widget::column::with_capacity(6)
+                            .push(widget::text(selected.autostart_path.clone()).size(12))
+                            .push(
+                                widget::button::standard(fl!("autostart-action-open-path"))
+                                    .on_press(Message::OpenSelectedAutostartPath)
+                                    .width(Length::Fill)
+                                    .height(button_height),
+                            )
+                            .push(
+                                widget::button::standard(fl!("autostart-action-edit-desktop"))
+                                    .on_press(Message::EditSelectedAutostartDesktop)
+                                    .width(Length::Fill)
+                                    .height(button_height),
+                            )
+                            .push(
+                                widget::button::destructive(fl!("autostart-action-remove"))
+                                    .on_press(Message::RequestRemoveSelectedAutostart)
+                                    .width(Length::Fill)
+                                    .height(button_height),
+                            )
+                            .spacing(8)
+                            .width(Length::Fill)
+                            .into()
+                    } else {
+                        widget::text(fl!("autostart-none-selected")).into()
+                    };
+
+                let padded_content = widget::container(content).padding([0, 20, 0, 0]);
+                context_drawer::context_drawer(padded_content, Message::CloseAutostartEntryMenu)
+                    .title(title)
+            }
         })
     }
 
     fn dialog(&self) -> Option<Element<'_, Self::Message>> {
-        self.autostart_add_dialog()
+        self.autostart_remove_dialog()
+            .or_else(|| self.autostart_add_dialog())
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
@@ -657,6 +743,50 @@ impl cosmic::Application for AppModel {
             }
             Message::ConfirmAutostartModal => {
                 self.confirm_autostart_modal();
+            }
+            Message::CreateCustomAutostartDesktop => {
+                self.create_custom_autostart_desktop();
+            }
+            Message::ImportAutostartDesktopFromFile => {
+                self.import_autostart_desktop_from_file();
+            }
+            Message::DismissAutostartFeedback => self.dismiss_autostart_feedback(),
+            Message::OpenAutostartEntryMenu {
+                name,
+                autostart_path,
+                is_background,
+            } => {
+                self.selected_autostart_entry = Some(SelectedAutostartEntry {
+                    name,
+                    autostart_path,
+                    is_background,
+                });
+                self.context_page = ContextPage::AutostartActions;
+                self.core.window.show_context = true;
+            }
+            Message::CloseAutostartEntryMenu => {
+                self.core.window.show_context = false;
+                self.autostart_remove_modal_open = false;
+                if self.context_page == ContextPage::AutostartActions {
+                    self.selected_autostart_entry = None;
+                }
+            }
+            Message::OpenSelectedAutostartPath => {
+                self.open_selected_autostart_path();
+                self.core.window.show_context = false;
+            }
+            Message::EditSelectedAutostartDesktop => {
+                self.edit_selected_autostart_desktop();
+                self.core.window.show_context = false;
+            }
+            Message::RequestRemoveSelectedAutostart => {
+                self.request_remove_selected_autostart();
+            }
+            Message::CancelRemoveSelectedAutostart => {
+                self.cancel_remove_selected_autostart();
+            }
+            Message::ConfirmRemoveSelectedAutostart => {
+                self.confirm_remove_selected_autostart();
             }
             Message::ToggleAutostartDesktopSection => {
                 self.autostart_desktop_expanded = !self.autostart_desktop_expanded;
@@ -922,9 +1052,11 @@ impl AppModel {
     }
 
     fn read_gpu_runtime_info() -> GpuRuntimeInfo {
-        Self::read_gpu_runtime_from_nvidia_smi()
+        let mut info = Self::read_gpu_runtime_from_nvidia_smi()
             .or_else(Self::read_gpu_runtime_from_sysfs)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        info.mesa_version = Self::read_mesa_version();
+        info
     }
 
     fn read_gpu_runtime_from_nvidia_smi() -> Option<GpuRuntimeInfo> {
@@ -977,6 +1109,7 @@ impl AppModel {
             name: Self::short_gpu_name(&columns[0], "NVIDIA"),
             provider: "NVIDIA".to_string(),
             driver: columns[7].clone(),
+            mesa_version: None,
             utilization_percent,
             temperature_celsius,
             vram_used_bytes,
@@ -1010,6 +1143,7 @@ impl AppModel {
             name: Self::short_gpu_name(&name, &provider),
             provider,
             driver,
+            mesa_version: None,
             utilization_percent,
             temperature_celsius,
             vram_used_bytes,
@@ -1238,6 +1372,58 @@ impl AppModel {
             .filter(|part| !part.is_empty())
             .next_back()
             .and_then(|part| part.parse::<u64>().ok())
+    }
+
+    fn read_mesa_version() -> Option<String> {
+        static CACHED_MESA_VERSION: OnceLock<Option<String>> = OnceLock::new();
+        CACHED_MESA_VERSION
+            .get_or_init(Self::detect_mesa_version)
+            .clone()
+    }
+
+    fn detect_mesa_version() -> Option<String> {
+        for (program, args) in [
+            ("glxinfo", vec!["-B"]),
+            ("vulkaninfo", vec!["--summary"]),
+            ("eglinfo", vec![]),
+        ] {
+            let Ok(output) = Command::new(program)
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+            else {
+                continue;
+            };
+            if !output.status.success() {
+                continue;
+            }
+
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(version) = Self::extract_mesa_version(&text) {
+                return Some(version);
+            }
+        }
+
+        None
+    }
+
+    fn extract_mesa_version(text: &str) -> Option<String> {
+        let marker = "Mesa ";
+        for line in text.lines() {
+            let Some(index) = line.find(marker) else {
+                continue;
+            };
+            let start = index + marker.len();
+            let version = line[start..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+                .collect::<String>();
+            if !version.is_empty() {
+                return Some(version);
+            }
+        }
+        None
     }
 
     fn parse_temperature_celsius(raw: &str) -> Option<f32> {
@@ -1841,6 +2027,7 @@ pub enum ContextPage {
     #[default]
     About,
     ProcessActions,
+    AutostartActions,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

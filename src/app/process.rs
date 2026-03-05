@@ -19,6 +19,7 @@ impl AppModel {
     }
 
     pub(super) fn refresh_processes(&mut self) {
+        self.clear_expired_autostart_feedback();
         self.desktop_apps_by_exec = Self::load_desktop_app_map();
         self.refresh_autostart_state();
         self.disks.refresh(true);

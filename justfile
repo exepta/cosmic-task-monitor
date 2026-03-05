@@ -71,7 +71,7 @@ install-user:
 
 # Uninstalls installed files
 uninstall:
-    rm {{bin-dst}} {{desktop-dst}} {{appdata-dst}} {{icon-svg-dst}}
+    sudo rm {{bin-dst}} {{desktop-dst}} {{appdata-dst}} {{icon-svg-dst}}
 
 # Vendor dependencies locally
 vendor:
